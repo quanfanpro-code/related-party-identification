@@ -1,4 +1,4 @@
-# 关联方识别与核查 — 原创编排层
+﻿# 关联方识别与核查 — 原创编排层
 # Copyright (C) 2026 CPA-Q (quanfanpro-code)
 #
 # 本文件是 related-party-identification 的原创编排层,采用 GNU Affero General
@@ -8,7 +8,7 @@
 # 本项目的 scripts/cicpa/ 目录包含改编自 nigo/nigo-skills(MIT) 和
 # jackwener/OpenCLI(Apache-2.0) 的代码,分别保留原始许可证。
 # 详见 NOTICE 和 references/SOURCES.json。
-#import unittest
+import unittest
 
 from scripts.cicpa.client import (
     AuthenticationRequired,

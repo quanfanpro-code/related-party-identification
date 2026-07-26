@@ -1,4 +1,4 @@
-# 关联方识别与核查 — 注协完整维度导出器
+﻿# 关联方识别与核查 — 注协完整维度导出器
 # 本文件改编自 nigo/nigo-skills/cicpa-company-query(MIT)
 # 上游作者: nigo(涂佳兵) | 原始仓库: https://github.com/nigo81/nigo-skills
 # 上游协议: MIT
@@ -46,6 +46,7 @@ class ExportState:
     archive_path: str = ""
     extract_dir: str = ""
     message_zh: str = ""
+    direct_delivery: bool = False
 
 
 def save_export_state(path: Path, state: ExportState) -> None:
@@ -76,12 +77,14 @@ class CicpaExporter:
         client: CicpaClient,
         *,
         staging_root: Optional[Path] = None,
+        artifact_dir: Optional[Path] = None,
         now: Callable[[], str] = lambda: datetime.now().astimezone().strftime(
             "%Y-%m-%d %H:%M"
         ),
     ):
         self.client = client
         self.staging_root = Path(staging_root) if staging_root is not None else None
+        self.artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
         self._now = now
 
     @staticmethod
@@ -95,6 +98,9 @@ class CicpaExporter:
         return payload.get("data", {})
 
     def _new_staging_dir(self) -> Path:
+        if self.artifact_dir is not None:
+            self.artifact_dir.mkdir(parents=True, exist_ok=True)
+            return self.artifact_dir
         if self.staging_root is not None:
             self.staging_root.mkdir(parents=True, exist_ok=True)
         return Path(
@@ -229,6 +235,7 @@ class CicpaExporter:
             task_id=task_id,
             status="waiting",
             message_zh="完整维度导出已触发，正在等待对应下载任务",
+            direct_delivery=self.artifact_dir is not None,
         )
         save_export_state(state_path, state)
         return state
@@ -385,8 +392,8 @@ class CicpaExporter:
         url = str(task.get("url") or "")
         if not url:
             raise ExportValidationError("对应下载任务没有下载地址")
-        if url.startswith("/"):
-            url = self.ZSK_BASE + url
+        if not url.startswith("http"):
+            url = self.ZSK_BASE + "/" + url.lstrip("/")
         staging_dir = Path(state.staging_dir)
         staging_dir.mkdir(parents=True, exist_ok=True)
         archive_path = staging_dir / "complete-dimensions.zip"
@@ -397,7 +404,11 @@ class CicpaExporter:
             save_export_state(state_path, state)
             raise ExportValidationError(state.message_zh)
 
-        extract_dir = staging_dir / "complete-dimensions_files"
+        extract_dir = (
+            staging_dir
+            if state.direct_delivery
+            else staging_dir / "complete-dimensions_files"
+        )
         extract_dir.mkdir(parents=True, exist_ok=True)
         try:
             self._safe_extract(archive_path, extract_dir)

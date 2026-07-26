@@ -1,4 +1,4 @@
-# 关联方识别与核查 — 原创编排层
+﻿# 关联方识别与核查 — 原创编排层
 # Copyright (C) 2026 CPA-Q (quanfanpro-code)
 #
 # 本文件是 related-party-identification 的原创编排层,采用 GNU Affero General

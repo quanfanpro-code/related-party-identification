@@ -1,4 +1,4 @@
-# 关联方识别与核查 — 原创编排层
+﻿# 关联方识别与核查 — 原创编排层
 # Copyright (C) 2026 CPA-Q (quanfanpro-code)
 #
 # 本文件是 related-party-identification 的原创编排层,采用 GNU Affero General
@@ -8,9 +8,10 @@
 # 本项目的 scripts/cicpa/ 目录包含改编自 nigo/nigo-skills(MIT) 和
 # jackwener/OpenCLI(Apache-2.0) 的代码,分别保留原始许可证。
 # 详见 NOTICE 和 references/SOURCES.json。
-#from pathlib import Path
+from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 import unittest
 
 from scripts.cicpa.client import CompanyMatch, EquityEdge, KeyPerson
@@ -137,8 +138,16 @@ class DiscoveryRedFlagTests(unittest.TestCase):
             equity={"a": []},
         )
         export_candidates = [
-            SeedExportCandidate(name="客户公司", relation_type="客户", marked_related=True),
-            SeedExportCandidate(name="供应商公司", relation_type="供应商"),
+            SimpleNamespace(
+                name="客户公司",
+                relation_type="公开客户关系",
+                marked_related=True,
+                red_flags=(),
+            ),
+            SeedExportCandidate(
+                name="供应商公司",
+                relation_type="公开供应商关系",
+            ),
         ]
 
         result = discover(
@@ -148,7 +157,14 @@ class DiscoveryRedFlagTests(unittest.TestCase):
         )
 
         self.assertEqual(set(result.candidates), {"客户公司", "供应商公司"})
-        self.assertIn("导出表内关联标注", result.candidates["客户公司"].reasons)
+        self.assertIn(
+            "被审计单位完整维度导出：公开客户关系",
+            result.candidates["客户公司"].reasons,
+        )
+        self.assertNotIn(
+            "导出表内关联标注",
+            result.candidates["客户公司"].reasons,
+        )
         self.assertEqual(client.equity_calls, ["a"])
 
 

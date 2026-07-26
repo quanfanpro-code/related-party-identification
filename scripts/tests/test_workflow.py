@@ -1,4 +1,4 @@
-# 关联方识别与核查 — 原创编排层
+﻿# 关联方识别与核查 — 原创编排层
 # Copyright (C) 2026 CPA-Q (quanfanpro-code)
 #
 # 本文件是 related-party-identification 的原创编排层,采用 GNU Affero General
@@ -8,14 +8,18 @@
 # 本项目的 scripts/cicpa/ 目录包含改编自 nigo/nigo-skills(MIT) 和
 # jackwener/OpenCLI(Apache-2.0) 的代码,分别保留原始许可证。
 # 详见 NOTICE 和 references/SOURCES.json。
-#import json
+import json
+from datetime import datetime
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
+import zipfile
 
 import openpyxl
 
@@ -356,6 +360,102 @@ class NameListTests(unittest.TestCase):
         self.assertIn("名单", result.message_zh)
 
 
+def make_seed_counterparty_export(
+    path,
+    owner_name,
+    relation_label,
+    counterparty_name,
+):
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append([
+        "序号",
+        "公司名称",
+        "公告时间",
+        "金额",
+        "占比（%）",
+        "与本公司关系",
+        "货币代码",
+        "关联方名称",
+        "关联方ID",
+        "关联理由",
+    ])
+    sheet.append([
+        1,
+        owner_name,
+        "2026-07-01",
+        100,
+        10,
+        relation_label,
+        "CNY",
+        counterparty_name,
+        "org-1",
+        "公开公告",
+    ])
+    workbook.save(path)
+
+
+def copy_with_wrong_dimension(source, destination):
+    with zipfile.ZipFile(source, "r") as input_zip:
+        with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as output_zip:
+            for item in input_zip.infolist():
+                content = input_zip.read(item.filename)
+                if item.filename == "xl/worksheets/sheet1.xml":
+                    text = content.decode("utf-8")
+                    text = re.sub(
+                        r'<dimension ref="[^"]+"',
+                        '<dimension ref="A1:A2"',
+                        text,
+                        count=1,
+                    )
+                    content = text.encode("utf-8")
+                output_zip.writestr(item, content)
+
+
+class SeedExportCandidateTests(unittest.TestCase):
+    def test_客户供应商第八列是公开交易对手而不是关联方认定(self):
+        artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_counterparty_extract_"))
+        make_seed_counterparty_export(
+            artifact_dir / "客户.xlsx",
+            "甲公司",
+            "客户",
+            "客户公司",
+        )
+        make_seed_counterparty_export(
+            artifact_dir / "供应商.xlsx",
+            "甲公司",
+            "供应商",
+            "供应商公司",
+        )
+
+        candidates = extract_seed_export_candidates(artifact_dir)
+
+        self.assertEqual(
+            [(item.name, item.relation_type) for item in candidates],
+            [("客户公司", "公开客户关系"), ("供应商公司", "公开供应商关系")],
+        )
+        self.assertNotIn("甲公司", [item.name for item in candidates])
+
+    def test_错误工作表范围信息不影响交易对手提取(self):
+        artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_wrong_dimension_"))
+        source = artifact_dir / "原始客户.xlsx"
+        customer_path = artifact_dir / "客户.xlsx"
+        make_seed_counterparty_export(
+            source,
+            "甲公司",
+            "客户",
+            "客户公司",
+        )
+        copy_with_wrong_dimension(source, customer_path)
+
+        candidates = extract_seed_export_candidates(artifact_dir)
+
+        self.assertEqual(
+            [(item.name, item.relation_type) for item in candidates],
+            [("客户公司", "公开客户关系")],
+        )
+
+
 class FakeChecker:
     def __init__(self):
         self.calls = []
@@ -433,10 +533,14 @@ class WorkflowModeTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(len(checker.calls), 1)
         self.assertEqual(checker.calls[0]["data_dir"], data_dir)
+        self.assertEqual(
+            result.report_paths,
+            [artifact_dir / "甲公司_关联方核查报告.xlsx"],
+        )
 
     def test_名单核查模式只导出用户明确提供的名称(self):
         artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_list_mode_"))
-        data_dir = artifact_dir / "exported_files"
+        data_dir = artifact_dir / "甲公司_注协原始导出"
         data_dir.mkdir()
         list_path = artifact_dir / "客户名单.txt"
         list_path.write_text("乙公司\n丙公司\n", encoding="utf-8-sig")
@@ -462,10 +566,17 @@ class WorkflowModeTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(exporter.start_calls, [["甲公司", "乙公司", "丙公司"]])
         self.assertEqual(checker.calls[0]["task_mode"], "list_check")
+        self.assertEqual(
+            set(result.report_paths),
+            {
+                data_dir,
+                artifact_dir / "甲公司_关联方核查报告.xlsx",
+            },
+        )
 
     def test_主动发现模式只给被审计单位做完整维度导出(self):
         artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_discovery_mode_"))
-        data_dir = artifact_dir / "audited_export_files"
+        data_dir = artifact_dir / "甲公司_注协原始导出"
         data_dir.mkdir()
         exporter = FakeExporter(data_dir)
         checker = FakeChecker()
@@ -505,7 +616,149 @@ class WorkflowModeTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(exporter.start_calls, [["甲公司"]])
         self.assertEqual(result.candidate_count, 1)
-        self.assertTrue((artifact_dir / "主动发现候选清单.xlsx").exists())
+        self.assertTrue(
+            (artifact_dir / "甲公司_主动发现候选清单.xlsx").exists()
+        )
+        self.assertEqual(
+            set(result.report_paths),
+            {
+                data_dir,
+                artifact_dir / "甲公司_主动发现候选清单.xlsx",
+                artifact_dir / "甲公司_关联方核查报告.xlsx",
+            },
+        )
+
+    def test_默认在线导出直接使用带公司名的成果目录(self):
+        artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_default_export_dir_"))
+        checker = FakeChecker()
+        state_path = artifact_dir / "task.json"
+        state = TaskState(
+            task_id="default-export-1",
+            mode="discovery",
+            audited_entity="甲公司",
+            output_dir=str(artifact_dir),
+        )
+        discovery_result = DiscoveryResult(
+            status="completed",
+            seed_name="甲公司",
+            candidates={},
+        )
+
+        def build_exporter(_client, *, artifact_dir):
+            artifact_dir.mkdir(parents=True)
+            return FakeExporter(artifact_dir)
+
+        try:
+            with patch(
+                "scripts.related_party_workflow.CicpaExporter",
+                side_effect=build_exporter,
+            ):
+                result = run_workflow(
+                    state,
+                    state_path,
+                    client_factory=lambda: object(),
+                    exporter_factory=None,
+                    discoverer=lambda *_args, **_kwargs: discovery_result,
+                    checker=checker,
+                )
+        except TypeError as exc:
+            self.fail("默认在线导出尚未接收成果目录：{}".format(exc))
+
+        raw_export_dir = artifact_dir / "甲公司_注协原始导出"
+        self.assertTrue(raw_export_dir.is_dir())
+        self.assertIn(raw_export_dir, result.report_paths)
+
+    def test_公司名称清理后用于报告文件名(self):
+        long_name = "甲" * 79 + ".乙"
+        cases = (
+            (" 甲<乙>:公司. ", "甲_乙__公司_关联方核查报告.xlsx"),
+            ("CON", "_CON_关联方核查报告.xlsx"),
+            ("...", "未命名公司_关联方核查报告.xlsx"),
+            (long_name, "甲" * 79 + "_关联方核查报告.xlsx"),
+        )
+        for index, (audited_entity, expected_name) in enumerate(cases):
+            with self.subTest(audited_entity=audited_entity):
+                artifact_dir = Path(
+                    tempfile.mkdtemp(prefix="rpi_safe_company_name_")
+                )
+                data_dir = artifact_dir / "existing_files"
+                data_dir.mkdir()
+                state = TaskState(
+                    task_id="safe-name-{}".format(index),
+                    mode="existing_export",
+                    audited_entity=audited_entity,
+                    input_files=[str(data_dir)],
+                    output_dir=str(artifact_dir),
+                )
+
+                result = run_workflow(
+                    state,
+                    artifact_dir / "task.json",
+                    checker=FakeChecker(),
+                )
+
+                self.assertEqual(result.report_paths[0].name, expected_name)
+
+    def test_同名报告存在时增加时间戳且不覆盖旧文件(self):
+        artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_report_collision_"))
+        data_dir = artifact_dir / "existing_files"
+        data_dir.mkdir()
+        existing_report = artifact_dir / "甲公司_关联方核查报告.xlsx"
+        existing_report.write_bytes(b"existing-report")
+        state = TaskState(
+            task_id="collision-1",
+            mode="existing_export",
+            audited_entity="甲公司",
+            input_files=[str(data_dir)],
+            output_dir=str(artifact_dir),
+        )
+
+        result = run_workflow(
+            state,
+            artifact_dir / "task.json",
+            checker=FakeChecker(),
+        )
+
+        self.assertEqual(existing_report.read_bytes(), b"existing-report")
+        self.assertNotEqual(result.report_paths[0], existing_report)
+        self.assertTrue(
+            result.report_paths[0].name.startswith(
+                "甲公司_关联方核查报告_"
+            )
+        )
+
+    def test_同一秒已有时间戳报告时继续编号且不覆盖(self):
+        artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_report_collision_"))
+        data_dir = artifact_dir / "existing_files"
+        data_dir.mkdir()
+        original = artifact_dir / "甲公司_关联方核查报告.xlsx"
+        timestamped = (
+            artifact_dir / "甲公司_关联方核查报告_20260726_120000.xlsx"
+        )
+        original.write_bytes(b"original")
+        timestamped.write_bytes(b"timestamped")
+        state = TaskState(
+            task_id="collision-2",
+            mode="existing_export",
+            audited_entity="甲公司",
+            input_files=[str(data_dir)],
+            output_dir=str(artifact_dir),
+        )
+
+        with patch("scripts.related_party_workflow.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = datetime(2026, 7, 26, 12, 0, 0)
+            result = run_workflow(
+                state,
+                artifact_dir / "task.json",
+                checker=FakeChecker(),
+            )
+
+        self.assertEqual(original.read_bytes(), b"original")
+        self.assertEqual(timestamped.read_bytes(), b"timestamped")
+        self.assertEqual(
+            result.report_paths[0].name,
+            "甲公司_关联方核查报告_20260726_120000_2.xlsx",
+        )
 
     def test_恢复等待中的导出不会再次上传名单(self):
         artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_resume_export_"))
@@ -653,23 +906,59 @@ class SkillDocumentationContractTests(unittest.TestCase):
         self.assertIn('display_name: "关联方识别与核查"', metadata)
         self.assertIn("$related-party-identification", metadata)
 
-    def test_规则说明区分候选红旗硬证据和用户披露差异(self):
+    def test_规则说明区分公开候选和有效核查证据(self):
+        skill = self._read_if_exists("SKILL.md")
+        readme = self._read_if_exists("README.md")
         rules = self._read_if_exists("references/rules.md")
         dimensions = self._read_if_exists("references/dimensions.md")
         cases = self._read_if_exists("references/cases.md")
-        combined = rules + "\n" + dimensions + "\n" + cases
+        user_flow = self._read_if_exists("references/user-flow.md")
+        combined = "\n".join(
+            [skill, readme, rules, dimensions, cases, user_flow]
+        )
 
         for phrase in [
             "候选不等于关联方",
             "红旗不等于硬关联",
-            "用户未提供自报名单",
-            "不能声称“未披露”",
+            "公开客户关系",
+            "公开供应商关系",
+            "只作为候选",
+            "不能单独形成风险证据",
             "初始 2 层",
             "最多 5 层",
             "只能从完整维度导出",
         ]:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, combined)
+
+        for phrase in [
+            "注协标记关联关系",
+            "导出表内关联标注",
+        ]:
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(phrase, combined)
+
+        for phrase in [
+            "<公司名称>_关联方核查报告.xlsx",
+            "<公司名称>_主动发现候选清单.xlsx",
+            "<公司名称>_注协原始导出",
+        ]:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, combined)
+
+    def test_gitignore_不含搜索工具无法解析的末尾反斜杠(self):
+        lines = (self.skill_root / ".gitignore").read_text(
+            encoding="utf-8-sig"
+        ).splitlines()
+        invalid = [
+            line
+            for line in lines
+            if line.strip()
+            and not line.lstrip().startswith("#")
+            and line.endswith("\\")
+        ]
+
+        self.assertEqual(invalid, [])
 
 
 class BundleValidationTests(unittest.TestCase):

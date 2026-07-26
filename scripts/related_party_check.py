@@ -1,4 +1,4 @@
-# 关联方识别与核查 — 原创编排层
+﻿# 关联方识别与核查 — 原创编排层
 # Copyright (C) 2026 CPA-Q (quanfanpro-code)
 #
 # 本文件是 related-party-identification 的原创编排层,采用 GNU Affero General
@@ -14,7 +14,7 @@
 关联方核查引擎 / Related Party Identification Engine
 =====================================================
 读取 cicpa-company-query 完整导出的 _files 目录（52个维度 xlsx），
-对其中所有公司做八层规则比对，输出多 sheet Excel 核查报告。
+对其中所有公司做七类有效核查证据比对，输出多 sheet Excel 核查报告。
 
 规则集对齐证监会/财政部近年处罚案例（蓝山科技、天沃科技、卓朗科技、
 爱康科技、合纵科技等），把"监管认定的最低核查动作"固化成自动判定。
@@ -386,8 +386,6 @@ class Company:
     main_persons: list = field(default_factory=list)        # [(姓名, 职务)]
     investments: list = field(default_factory=list)         # [(被投资企业, 比例)]
     holdings: list = field(default_factory=list)            # [(参控股企业, 比例)]
-    customers_marked_related: list = field(default_factory=list)  # 客户表自带关联方名
-    suppliers_marked_related: list = field(default_factory=list)
     trademarks: list = field(default_factory=list)
     softwares: list = field(default_factory=list)
     wechats: list = field(default_factory=list)
@@ -462,13 +460,6 @@ def build_company(name, dim, basic_row):
     for r in dim.get("holding", {}).get(name, []):
         if len(r) >= 4 and r[2]:
             c.holdings.append((normalize_name(r[2]), strip_html(str(r[3] or ""))))
-    # 客户/供应商自带关联方标注
-    for r in dim.get("customer", {}).get(name, []):
-        if len(r) >= 8 and r[7]:
-            c.customers_marked_related.append(normalize_name(r[7]))
-    for r in dim.get("supplier", {}).get(name, []):
-        if len(r) >= 8 and r[7]:
-            c.suppliers_marked_related.append(normalize_name(r[7]))
     # 商标 / 软件 / 公众号
     for r in dim.get("trademark", {}).get(name, []):
         if len(r) >= 3 and r[2]:
@@ -540,7 +531,7 @@ def all_addresses(c: Company):
 
 
 # ============================================================
-# 规则引擎（八层）
+# 七类有效核查证据
 # ============================================================
 
 def rule1_fingerprint(ca: Company, cb: Company):
@@ -669,41 +660,6 @@ def rule3_counterparty_profile(ca: Company, cb: Company, target_set, as_of_date=
     if flags:
         hits.append(("profile", MEDIUM if len(flags) >= 2 else LOW,
                      "；".join(flags[:4]), "专网通信/爱康案"))
-    return hits
-
-
-def rule4_disclosed_gap(dim, target_name, company_names, disclosed_parties=None):
-    """维度4: 注协导出标注；有自报名单时才计算披露差异。"""
-    hits = []
-    # target 的客户/供应商表里被标注为"关联方"的公司名
-    marked = set()
-    for r in dim.get("customer", {}).get(target_name, []) + dim.get("supplier", {}).get(target_name, []):
-        if len(r) >= 8 and r[7]:
-            marked.add(normalize_name(r[7]))
-    # 标注本身就是候选证据，不要求该公司同时出现在基础工商表。
-    _ = company_names
-    matched = marked
-    disclosed = None
-    if disclosed_parties is not None:
-        disclosed = {normalize_name(name) for name in disclosed_parties if name}
-    for m in matched:
-        if m != target_name:
-            if disclosed is not None and m not in disclosed:
-                hits.append((
-                    "disclosed_gap",
-                    HARD,
-                    f"注协标记但未在用户自报名单出现: {m}",
-                    "洛娃集团案(客户已是关联方)",
-                    "用户披露差异",
-                ))
-            else:
-                hits.append((
-                    "marked_related",
-                    HARD,
-                    f"注协导出客户/供应商表标注关联关系: {m}",
-                    "洛娃集团案(客户已是关联方)",
-                    "注协标记关联关系",
-                ))
     return hits
 
 
@@ -963,15 +919,15 @@ def write_report(
     ws0.append(headers)
     for r in rows:
         ws0.append(list(r))
-    # 格式化汇总表（从第4行起）
+    # 第三行是表头，第四行起是数据。
     for c in range(1, len(headers) + 1):
-        cell = ws0.cell(row=start_row + 1, column=c)
+        cell = ws0.cell(row=start_row, column=c)
         cell.fill = FILL_HEADER
         cell.font = FONT_HEADER
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws0.row_dimensions[start_row + 1].height = 28
+    ws0.row_dimensions[start_row].height = 28
     for ri, s in enumerate(summary):
-        row_idx = start_row + 2 + ri
+        row_idx = start_row + 1 + ri
         lv = s["max_level"]
         fill = FILL_HARD if "硬" in lv else (FILL_MEDIUM if "可疑" in lv else FILL_LOW)
         for c in range(1, len(headers) + 1):
@@ -980,15 +936,13 @@ def write_report(
             cell.alignment = Alignment(vertical="top", wrap_text=True)
     for col, w in zip("ABCDEFGHI", [22, 22, 16, 16, 14, 22, 8, 45, 35]):
         ws0.column_dimensions[col].width = w
-    ws0.freeze_panes = "A5"
+    ws0.freeze_panes = "A4"
 
     # 各维度 sheet
     dim_sheets = {
         "工商指纹重合": ("01_工商指纹重合", ["公司A", "公司B", "子项", "风险等级", "证据", "监管出处"]),
         "关键人员重合": ("02_关键人员重合", ["公司A", "公司B", "子项", "风险等级", "证据", "监管出处"]),
         "客商异常画像": ("03_客商异常画像", ["公司A", "公司B", "子项", "风险等级", "证据", "监管出处"]),
-        "注协标记关联关系": ("04_注协标记关联", ["公司A", "公司B", "子项", "风险等级", "证据", "监管出处"]),
-        "用户披露差异": ("04b_用户披露差异", ["公司A", "公司B", "子项", "风险等级", "证据", "监管出处"]),
         "股权控制穿透": ("05_股权控制穿透", ["公司A", "公司B", "子项", "风险等级", "证据", "监管出处"]),
         "历史关联痕迹": ("06_历史关联痕迹", ["公司A", "公司B", "子项", "风险等级", "证据", "监管出处"]),
         "担保资金链": ("07_担保资金链", ["公司A", "公司B", "子项", "风险等级", "证据", "监管出处"]),
@@ -1126,23 +1080,6 @@ def run_check(
                 errors=errors,
             )
         )
-    for target in target_set:
-        for field_key, level, evidence, case, dimension in rule4_disclosed_gap(
-            dim,
-            target,
-            names,
-            disclosed_parties=disclosed_parties,
-        ):
-            all_hits.append({
-                "company_a": target,
-                "company_b": evidence.rsplit(": ", 1)[-1],
-                "dimension": dimension,
-                "field": field_key,
-                "level": level,
-                "evidence": evidence,
-                "case_ref": case,
-            })
-
     summary = aggregate(all_hits, target_set)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)

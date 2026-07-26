@@ -1,4 +1,4 @@
-# 关联方识别与核查 — 原创编排层
+﻿# 关联方识别与核查 — 原创编排层
 # Copyright (C) 2026 CPA-Q (quanfanpro-code)
 #
 # 本文件是 related-party-identification 的原创编排层,采用 GNU Affero General
@@ -37,7 +37,6 @@ class DiscoveryPolicy:
 class SeedExportCandidate:
     name: str
     relation_type: str
-    marked_related: bool = False
     red_flags: tuple = ()
 
 
@@ -158,8 +157,6 @@ def discover(
         if not candidate_name or candidate_name == seed.name:
             continue
         reasons = ["被审计单位完整维度导出：{}".format(item.relation_type)]
-        if item.marked_related:
-            reasons.append("导出表内关联标注")
         reasons.extend(str(flag) for flag in item.red_flags if str(flag).strip())
         added = add_candidate(
             Candidate(

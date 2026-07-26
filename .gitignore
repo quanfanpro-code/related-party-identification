@@ -14,7 +14,6 @@ venv/
 .venv/
 env/
 .env
-%LOCALAPPDATA%\related-party-identification\
 
 # IDE
 .idea/

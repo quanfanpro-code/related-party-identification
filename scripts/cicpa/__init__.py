@@ -1,4 +1,4 @@
-# Copyright (C) 2026 CPA-Q (quanfanpro-code)
+﻿# Copyright (C) 2026 CPA-Q (quanfanpro-code)
 """中注协查询、认证和导出能力。"""
 
 from .client import (

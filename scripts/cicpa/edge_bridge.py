@@ -1,4 +1,4 @@
-# 关联方识别与核查 — Edge/Chrome OpenCLI 本地桥接
+﻿# 关联方识别与核查 — Edge/Chrome OpenCLI 本地桥接
 # 本文件改编自 jackwener/OpenCLI(extension)(Apache-2.0)
 # 上游项目: OpenCLI | 仓库: https://gitee.com/github_dep/opencli
 # 上游协议: Apache-2.0

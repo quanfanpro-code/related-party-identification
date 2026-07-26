@@ -1,4 +1,4 @@
-# 关联方识别与核查 — 注协登录凭据管理
+﻿# 关联方识别与核查 — 注协登录凭据管理
 # 本文件改编自 nigo/nigo-skills/cicpa-company-query(MIT)
 # 上游作者: nigo(涂佳兵) | 原始仓库: https://github.com/nigo81/nigo-skills
 # 上游协议: MIT

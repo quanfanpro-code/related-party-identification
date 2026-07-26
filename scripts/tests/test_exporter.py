@@ -1,4 +1,4 @@
-# 关联方识别与核查 — 原创编排层
+﻿# 关联方识别与核查 — 原创编排层
 # Copyright (C) 2026 CPA-Q (quanfanpro-code)
 #
 # 本文件是 related-party-identification 的原创编排层,采用 GNU Affero General
@@ -8,7 +8,7 @@
 # 本项目的 scripts/cicpa/ 目录包含改编自 nigo/nigo-skills(MIT) 和
 # jackwener/OpenCLI(Apache-2.0) 的代码,分别保留原始许可证。
 # 详见 NOTICE 和 references/SOURCES.json。
-#from io import BytesIO
+from io import BytesIO
 import json
 from pathlib import Path
 import tempfile
@@ -74,6 +74,7 @@ class ExportFlowTests(unittest.TestCase):
         artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_export_flow_"))
         state_path = artifact_dir / "export-state.json"
         zip_bytes = make_export_zip(["甲公司"], artifact_dir)
+        delivery_dir = artifact_dir / "甲公司_注协原始导出"
         client = FakeClient(
             json_results=[
                 {
@@ -145,21 +146,30 @@ class ExportFlowTests(unittest.TestCase):
             ],
             binary_result=zip_bytes,
         )
-        exporter = CicpaExporter(
-            client,
-            staging_root=artifact_dir,
-            now=lambda: "2026-07-26 15:00",
-        )
+        try:
+            exporter = CicpaExporter(
+                client,
+                artifact_dir=delivery_dir,
+                now=lambda: "2026-07-26 15:00",
+            )
+        except TypeError as exc:
+            self.fail("导出器尚未支持精确成果目录：{}".format(exc))
 
         state = exporter.start_export(["甲公司"], state_path)
         task = exporter.wait_for_task(state, state_path, max_polls=1)
         extract_dir = exporter.download_and_validate(state, task, state_path)
 
         reloaded = load_export_state(state_path)
+        self.assertEqual(Path(state.staging_dir), delivery_dir)
+        self.assertTrue(state.direct_delivery)
         self.assertEqual(reloaded.batch_no, "batch-new")
         self.assertEqual(reloaded.task_id, "task-new")
         self.assertEqual(reloaded.status, "completed")
+        self.assertEqual(extract_dir, delivery_dir)
         self.assertTrue((extract_dir / "基础工商信息.xlsx").exists())
+        self.assertTrue((delivery_dir / "complete-dimensions.zip").exists())
+        self.assertTrue((delivery_dir / "upload-companies.xlsx").exists())
+        self.assertFalse((delivery_dir / "complete-dimensions_files").exists())
         self.assertEqual(
             client.binary_calls[0][1],
             "https://zsk-cmis.cicpa.org.cn/download/task-new.zip",

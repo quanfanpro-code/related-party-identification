@@ -1,4 +1,4 @@
-# 关联方识别与核查 — 原创编排层
+﻿# 关联方识别与核查 — 原创编排层
 # Copyright (C) 2026 CPA-Q (quanfanpro-code)
 #
 # 本文件是 related-party-identification 的原创编排层,采用 GNU Affero General
@@ -18,6 +18,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -429,11 +430,14 @@ def extract_seed_export_candidates(data_dir) -> List[SeedExportCandidate]:
         return []
     candidates = []
     seen = set()
-    for filename, relation_type in (("客户.xlsx", "客户"), ("供应商.xlsx", "供应商")):
+    for filename, relation_type in (
+        ("客户.xlsx", "公开客户关系"),
+        ("供应商.xlsx", "公开供应商关系"),
+    ):
         path = Path(data_dir) / filename
         if not path.is_file():
             continue
-        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        workbook = openpyxl.load_workbook(path, data_only=True)
         try:
             rows = list(workbook.active.iter_rows(values_only=True))
         finally:
@@ -441,36 +445,22 @@ def extract_seed_export_candidates(data_dir) -> List[SeedExportCandidate]:
         if not rows:
             continue
         headers = [str(value).strip() if value is not None else "" for value in rows[0]]
-        name_index = next(
-            (
-                headers.index(header)
-                for header in (
-                    "{}名称".format(relation_type),
-                    "企业名称",
-                    "公司名称",
-                    "名称",
-                )
-                if header in headers
-            ),
-            None,
-        )
-        related_index = next(
+        counterparty_index = next(
             (
                 index
                 for index, header in enumerate(headers)
-                if "关联方名称" in header or "关联方ID" in header
+                if header == "关联方名称"
             ),
             7 if len(headers) >= 8 else None,
         )
         for row in rows[1:]:
             candidate_name = ""
-            if name_index is not None and name_index < len(row) and row[name_index]:
-                candidate_name = str(row[name_index]).strip()
-            marked_name = ""
-            if related_index is not None and related_index < len(row) and row[related_index]:
-                marked_name = str(row[related_index]).strip()
-            if not candidate_name:
-                candidate_name = marked_name
+            if (
+                counterparty_index is not None
+                and counterparty_index < len(row)
+                and row[counterparty_index]
+            ):
+                candidate_name = str(row[counterparty_index]).strip()
             if not candidate_name or candidate_name in seen:
                 continue
             seen.add(candidate_name)
@@ -478,7 +468,6 @@ def extract_seed_export_candidates(data_dir) -> List[SeedExportCandidate]:
                 SeedExportCandidate(
                     name=candidate_name,
                     relation_type=relation_type,
-                    marked_related=bool(marked_name),
                 )
             )
     return candidates
@@ -500,6 +489,24 @@ def _default_checker(**kwargs):
     return run_check(**kwargs)
 
 
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *{"COM{}".format(index) for index in range(1, 10)},
+    *{"LPT{}".format(index) for index in range(1, 10)},
+}
+
+
+def _safe_company_stem(name: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name).strip())
+    cleaned = cleaned.rstrip(" .")[:80].rstrip(" .") or "未命名公司"
+    if cleaned.upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned = "_" + cleaned
+    return cleaned
+
+
 def _safe_output_path(folder: Path, filename: str) -> Path:
     path = folder / filename
     if not path.exists():
@@ -507,7 +514,17 @@ def _safe_output_path(folder: Path, filename: str) -> Path:
     stem = path.stem
     suffix = path.suffix
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return folder / "{}_{}{}".format(stem, timestamp, suffix)
+    candidate = folder / "{}_{}{}".format(stem, timestamp, suffix)
+    counter = 2
+    while candidate.exists():
+        candidate = folder / "{}_{}_{}{}".format(
+            stem,
+            timestamp,
+            counter,
+            suffix,
+        )
+        counter += 1
+    return candidate
 
 
 def _ensure_export(state, state_path, exporter, company_names) -> Path:
@@ -564,7 +581,7 @@ def run_workflow(
     state_path,
     *,
     client_factory: Callable = _default_client_factory,
-    exporter_factory: Callable = CicpaExporter,
+    exporter_factory: Optional[Callable] = None,
     discoverer: Callable = discover,
     checker: Callable = _default_checker,
 ) -> WorkflowResult:
@@ -572,6 +589,7 @@ def run_workflow(
     state_file = Path(state_path)
     output_dir = Path(state.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    company_stem = _safe_company_stem(state.audited_entity)
     state.stage = "running"
     state.status = "running"
     save_task_state(state_file, state)
@@ -591,7 +609,14 @@ def run_workflow(
         candidate_count = 0
     elif state.mode in {"list_check", "discovery"}:
         client = client_factory()
-        exporter = exporter_factory(client)
+        raw_export_dir = _safe_output_path(
+            output_dir,
+            "{}_注协原始导出".format(company_stem),
+        )
+        if exporter_factory is None:
+            exporter = CicpaExporter(client, artifact_dir=raw_export_dir)
+        else:
+            exporter = exporter_factory(client)
         if state.mode == "list_check":
             names = []
             rejected = []
@@ -626,6 +651,9 @@ def run_workflow(
                     rejected_inputs=state.rejected_inputs,
                 )
             data_dir = _ensure_export(state, state_file, exporter, names)
+            state.report_paths = list(
+                dict.fromkeys(state.report_paths + [str(data_dir)])
+            )
             candidate_count = len(names) - 1
         else:
             data_dir = _ensure_export(
@@ -633,6 +661,9 @@ def run_workflow(
                 state_file,
                 exporter,
                 [state.audited_entity],
+            )
+            state.report_paths = list(
+                dict.fromkeys(state.report_paths + [str(data_dir)])
             )
             discovery_result = discoverer(
                 state.audited_entity,
@@ -655,14 +686,22 @@ def run_workflow(
                     state.message_zh,
                     candidate_count=state.candidate_count,
                 )
-            candidate_path = _safe_output_path(output_dir, "主动发现候选清单.xlsx")
+            candidate_path = _safe_output_path(
+                output_dir,
+                "{}_主动发现候选清单.xlsx".format(company_stem),
+            )
             _write_candidate_report(candidate_path, discovery_result)
-            state.report_paths = [str(candidate_path)]
+            state.report_paths = list(
+                dict.fromkeys(state.report_paths + [str(candidate_path)])
+            )
             candidate_count = state.candidate_count
     else:
         raise ValueError("未知工作流模式：{}".format(state.mode))
 
-    report_path = _safe_output_path(output_dir, "关联方核查报告.xlsx")
+    report_path = _safe_output_path(
+        output_dir,
+        "{}_关联方核查报告.xlsx".format(company_stem),
+    )
     checker(
         data_dir=data_dir,
         target_names=[state.audited_entity],

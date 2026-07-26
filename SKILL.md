@@ -1,3 +1,8 @@
+---
+name: related-party-identification
+description: Use when a user asks to identify, discover, check, or investigate related parties, hidden related parties, customer or supplier relationships, equity or control links, or CICPA company data for a Chinese audit.
+---
+
 <!--
   关联方识别与核查 — 原创编排层
   Copyright (C) 2026 CPA-Q (quanfanpro-code)
@@ -10,10 +15,6 @@
   jackwener/OpenCLI(Apache-2.0) 的代码,分别保留原始许可证。
   详见 NOTICE 和 references/SOURCES.json。
 -->
----
-name: related-party-identification
-description: Use when a user asks to identify, discover, check, or investigate related parties, hidden related parties, customer or supplier relationships, equity or control links, or CICPA company data for a Chinese audit.
----
 
 # 关联方识别与核查
 
@@ -43,7 +44,7 @@ description: Use when a user asks to identify, discover, check, or investigate r
 6. 名单核查只查询被审计单位和用户明确提供的公司。遇到多个可能的名称列时，列出表头让用户选；不得自行猜测。
 7. 已有数据入口不得创建注协客户端或要求登录。选择目录后直接运行核查，并明确本次结论只覆盖该目录实际包含的数据。
 8. 所有注协请求串行执行：每分钟最多 15 次、每小时最多 300 次；普通查询随机等待 2—5 秒，导出轮询随机等待 10—20 秒。遇到限速提示按等待策略暂停，不并发冲击接口。这里是本技能的保守自我约束，不是注协官方公布限额。
-9. 输出后先讲范围，再讲高风险证据、可疑红旗、数据缺口和建议审计程序。用户未提供自报名单时，注协导出中的关系标记只能作为“注协标记关系”证据，不能声称“未披露”。
+9. 输出后先讲范围，再讲高风险证据、可疑红旗、数据缺口和建议审计程序。客户、供应商表中的“关联方名称”是公开交易关系的对手方名称：公开客户关系、公开供应商关系只作为候选，不能单独形成风险证据，更不能直接写成“关联方”或“未披露”。
 
 ### 🔴 CHECKPOINT / 🛑 STOP
 
@@ -75,13 +76,13 @@ description: Use when a user asks to identify, discover, check, or investigate r
 
 ## 证据框架
 
-按八个维度输出证据：工商指纹、关键人员、客商画像、注协标记/用户披露差异、股权控制、历史痕迹、担保资金链、无形资产共用。高风险证据必须查清；可疑红旗用于安排进一步程序。详细阈值和案例只在需要解释结果时读取 `references/rules.md` 与 `references/cases.md`。
+按七类有效核查证据输出结果：工商指纹、关键人员、客商画像、股权控制、历史痕迹、担保资金链、无形资产共用。高风险证据必须查清；可疑红旗用于安排进一步程序。公开客户关系和公开供应商关系只用于扩充候选范围，不属于上述七类有效核查证据。详细阈值和案例只在需要解释结果时读取 `references/rules.md` 与 `references/cases.md`。
 
 ## 核查与交付
 
 使用 `scripts/related_party_workflow.py` 统一编排任务，使用 `scripts/related_party_check.py` 生成核查报告。允许恢复等待中的导出任务，但不得重新上传同一名单或把下载中心“最新任务”误当成本次结果。
 
-主动发现入口把候选链路单独写入 `主动发现候选清单.xlsx`；它用于说明“为什么查到这家公司”，不是关系认定。核查引擎只对本次实际取得的数据做全图比对。
+主动发现入口把候选链路单独写入 `<公司名称>_主动发现候选清单.xlsx`；它用于说明“为什么查到这家公司”，不是关系认定。核查引擎只对本次实际取得的数据做全图比对。
 
 ### 解读报告
 
@@ -98,11 +99,11 @@ description: Use when a user asks to identify, discover, check, or investigate r
 
 ## 输出
 
-交付多 sheet Excel 核查报告，至少包含汇总判断、各维度原始证据、任务范围、输入数据概览、数据质量与限制。主动发现入口另交付候选清单及每家候选的发现路径。
+交付多 sheet Excel 核查报告，至少包含汇总判断、各类原始证据、任务范围、输入数据概览、数据质量与限制。核查报告命名为 `<公司名称>_关联方核查报告.xlsx`；主动发现入口另交付 `<公司名称>_主动发现候选清单.xlsx` 及每家候选的发现路径；在线取数的基础数据放在同一交付目录下的 `<公司名称>_注协原始导出` 文件夹。
 
 ## 自包含注协数据层
 
-本技能已经内置搜索、详情、股东、主要人员、股权、子公司发现以及完整维度导出的真实接口，不依赖另一个技能目录。Firefox 登录读取和 Edge/Chrome 的 OpenCLI 本地桥接也已内置；OpenCLI 扩展文件从 Gitee 国内镜像固定版本取得并逐文件校验。客户、供应商、最终受益人和变更记录没有独立查询接口，只能从完整维度导出中取得；主动发现入口只保证被审计单位本身有这类完整数据。
+本技能已经内置搜索、详情、股东、主要人员、股权、子公司发现以及完整维度导出的真实接口，不依赖另一个技能目录。Firefox 登录读取和 Edge/Chrome 的 OpenCLI 本地桥接也已内置；OpenCLI 扩展文件从 Gitee 国内镜像固定版本取得并逐文件校验。客户、供应商、最终受益人和变更记录没有独立查询接口，只能从完整维度导出中取得；主动发现入口只保证被审计单位本身有这类完整数据。客户、供应商文件仅提供公开交易关系中的对手方名称，不能把表头中的“关联方名称”按字面解释为会计准则意义上的关联方。
 
 完整文件和字段映射见 `references/dimensions.md`；详细规则、阈值和证据分级见 `references/rules.md`。
 
@@ -121,7 +122,7 @@ description: Use when a user asks to identify, discover, check, or investigate r
 - **企业名称必须用工商全称**：否则 cicpa 导出会匹配 0 家。
 - **数据时效**：工商数据有滞后（变更、注销可能未及时更新），核查结果需结合函证、走访等程序验证。
 - **已注销公司查不到**：部分造假空壳公司事后注销，cicpa 可能无数据。这种情况报告里会标注"数据缺失"。
-- **亲属关系（第9维度）受限于公开数据**：工商数据不直接提供亲属关系，只能通过"同名+同姓+同地址"间接推断，需谨慎。
+- **亲属关系受限于公开数据**：工商数据不直接提供亲属关系，只能通过"同名+同姓+同地址"间接推断，需谨慎。
 
 ## 何时不用
 
@@ -132,7 +133,7 @@ description: Use when a user asks to identify, discover, check, or investigate r
 ## 参考
 
 - `references/user-flow.md` —— 非技术用户逐句引导、异常分流和范围确认
-- `references/rules.md` —— 八层规则详解（识别原理、具体规则、阈值、红旗信号、监管出处）
+- `references/rules.md` —— 七类有效核查证据详解（识别原理、具体规则、阈值、红旗信号、监管出处）
 - `references/cases.md` —— 处罚案例库（监管认定的过错 → 对应核查规则）
 - `references/dimensions.md` —— 注协完整维度字段与本技能规则的映射
 - `references/SOURCES.json` 与 `NOTICE` —— 内置数据层的来源、基线版本和本地改造说明
