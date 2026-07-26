@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "runtime_self_contained": true,
+  "sources": [
+    {
+      "component": "cicpa-company-query",
+      "author": "nigo",
+      "repository": "https://github.com/nigo81/nigo-skills",
+      "source_path": "cicpa-company-query",
+      "baseline_commit": "0657de949b42b5177a7e2a9a1f9c19b5deac926a",
+      "baseline_verified_at": "2026-07-26",
+      "license_evidence": {
+        "type": "repository README declaration",
+        "value": "MIT",
+        "readme_path": "README.md",
+        "license_file_verified": false,
+        "note_zh": "仅记录上游 README 的 MIT 声明，未虚构或捆绑独立 LICENSE 文件。"
+      },
+      "source_snapshot": [
+        {
+          "path": "cicpa-company-query/SKILL.md",
+          "sha256": "972040df108baa17dd44bb4e6e12b98db624d8a2cd1ec7df3004997899589167",
+          "git_blob": "637b030355293783e360edc485633033dbf8f6a4"
+        },
+        {
+          "path": "cicpa-company-query/scripts/cicpa_query.py",
+          "sha256": "809fd1958c6c2f82244264c0210a562eab41c309f11a3940a6031973889d705b",
+          "git_blob": "d4c81d13b69bff18a1b6ba295786767bf46a9e21"
+        }
+      ],
+      "local_modules": [
+        "scripts/cicpa/client.py",
+        "scripts/cicpa/auth.py",
+        "scripts/cicpa/exporter.py"
+      ],
+      "source_mapping": [
+        {
+          "source": "cicpa-company-query/scripts/cicpa_query.py",
+          "locals": [
+            "scripts/cicpa/client.py",
+            "scripts/cicpa/auth.py",
+            "scripts/cicpa/exporter.py"
+          ]
+        },
+        {
+          "source": "cicpa-company-query/SKILL.md",
+          "locals": [
+            "SKILL.md",
+            "references/user-flow.md",
+            "references/dimensions.md"
+          ]
+        }
+      ],
+      "local_adaptation_points": [
+        "Windows 当前用户加密与可见官方网页登录",
+        "串行限速、随机延迟和有限退避",
+        "批次号与下载任务的严格关联",
+        "主动发现、名单核查、已有数据三入口",
+        "候选、红旗、硬证据与用户披露差异边界",
+        "报告任务范围、数据质量和限制"
+      ],
+      "adaptation_note_zh": "本地改造：拆分查询、认证和导出模块；加入 Windows 当前用户加密、统一限速与重试、任务关联校验、断点恢复，并接入关联方主动发现和核查工作流。",
+      "sync_contract": {
+        "mode": "check-stage-verify-record",
+        "automatic_overwrite": false,
+        "update_only_after_tests": true,
+        "record_file": "references/SOURCES.json"
+      }
+    },
+    {
+      "component": "OpenCLI Browser Bridge extension",
+      "author": "jackwener",
+      "repository": "https://gitee.com/github_dep/opencli",
+      "source_path": "extension",
+      "baseline_commit": "10baf02060bda736234c160927ccd4c9d0af82b6",
+      "baseline_verified_at": "2026-07-26",
+      "license_evidence": {
+        "type": "repository LICENSE file",
+        "value": "Apache-2.0",
+        "license_path": "LICENSE",
+        "license_file_verified": true,
+        "note_zh": "固定提交中已核实独立 Apache License 2.0 文件。"
+      },
+      "source_snapshot": [
+        {
+          "path": "extension/manifest.json",
+          "sha256": "0f897bac24f1dfbe835d0fc9fbc6f32ae3750316acf7a6fcbe978668f4e6e28c",
+          "git_blob": "605408e8fbea90c985117008e70c354d1a19011f"
+        },
+        {
+          "path": "extension/popup.html",
+          "sha256": "9e0572175c7619056d77a618425cc7e6888eccfad7a1d5ffa74e8c784eece918",
+          "git_blob": "02ca1b972d71c2b14c6e02ac7222f95967e1ff84"
+        },
+        {
+          "path": "extension/popup.js",
+          "sha256": "c9e89f350ce1c97af3ff538debe63cda3dc98cbac119b99f41d4d411a26d5776",
+          "git_blob": "4bd3a7d4867ca24b36f042007d13c291e92e977d"
+        },
+        {
+          "path": "extension/dist/background.js",
+          "sha256": "871ca5a89cd869c5b91d255680923dd939d560d40d7c5763c121674af44b6140",
+          "git_blob": "49b0978d3dcb826af916aace2edc8544e2b78304"
+        },
+        {
+          "path": "extension/icons/icon-16.png",
+          "sha256": "41f055dfbcfa48a06d81c2733d686a39ab6c4aae3efa1e26247dddf4fa00ec95",
+          "git_blob": "b9d9e40a559b020fad06f7c5d430af181b8bf2a7"
+        },
+        {
+          "path": "extension/icons/icon-32.png",
+          "sha256": "415856e54bd712b13bc369b404cc0676080ad9fe5836bd82f5e066097ebc33e7",
+          "git_blob": "9c3b66ec67f6a716cb4d06779b9b056e81e4a075"
+        },
+        {
+          "path": "extension/icons/icon-48.png",
+          "sha256": "60a028b636ae832d995158ecec742c47cad7784187ab06108410154194217184",
+          "git_blob": "e17cea903345965c2c948ef5b2b02a742b5bba07"
+        },
+        {
+          "path": "extension/icons/icon-128.png",
+          "sha256": "4b146c873a1f6e21f129e9d9ad7a6e56d48f64f536ef160468e967f265c424a4",
+          "git_blob": "4c6c5a1894b8dada3bf56ecd56cab2852f8c2810"
+        }
+      ],
+      "local_modules": [
+        "scripts/cicpa/edge_bridge.py",
+        "scripts/cicpa/opencli_setup.py",
+        "scripts/cicpa/auth.py",
+        "scripts/related_party_workflow.py"
+      ],
+      "source_mapping": [
+        {
+          "source": "extension/dist/background.js",
+          "locals": [
+            "scripts/cicpa/edge_bridge.py"
+          ]
+        },
+        {
+          "source": "extension/manifest.json",
+          "locals": [
+            "scripts/cicpa/opencli_setup.py",
+            "references/user-flow.md"
+          ]
+        }
+      ],
+      "local_adaptation_points": [
+        "只接收注协站点登录态的本地最小桥接",
+        "从 Gitee 国内镜像下载固定版本并逐文件校验",
+        "Edge/Chrome 当前用户原有个人配置",
+        "一次一个动作的非技术安装引导",
+        "不要求 Node、整套 OpenCLI 命令行或编译"
+      ],
+      "adaptation_note_zh": "本地只复用 OpenCLI 已编译浏览器扩展与既有消息协议，加入固定版本校验、图形化安装引导和注协登录状态接收；不会打开扩展弹窗页面。",
+      "sync_contract": {
+        "mode": "check-stage-verify-record",
+        "automatic_overwrite": false,
+        "upstream_repository": "https://gitee.com/github_dep/opencli",
+        "tracked_paths": [
+          "extension/manifest.json",
+          "extension/popup.html",
+          "extension/popup.js",
+          "extension/dist/background.js",
+          "extension/icons"
+        ],
+        "update_only_after_tests": true,
+        "record_file": "references/SOURCES.json"
+      }
+    }
+  ]
+}

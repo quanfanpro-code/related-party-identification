@@ -1,0 +1,4 @@
+interface:
+  display_name: "关联方识别与核查"
+  short_description: "从被审计单位名称、公司名单或注协完整导出发现并核查关联方候选"
+  default_prompt: "请使用 $related-party-identification，从被审计单位名称开始引导我发现并核查关联方候选。"
