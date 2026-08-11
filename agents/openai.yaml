@@ -1,4 +1,4 @@
 interface:
   display_name: "关联方识别与核查"
-  short_description: "从被审计单位名称、公司名单或注协完整导出发现并核查关联方候选"
-  default_prompt: "请使用 $related-party-identification，从被审计单位名称开始引导我发现并核查关联方候选。"
+  short_description: "通过注协20维批量取数，连续三次失败后逐项下载并核查关联方候选"
+  default_prompt: "请使用 $related-party-identification，从被审计单位名称开始，按20个维度10+10分批取数；批量接口连续失败3次后逐个下载尚未完成维度，再核查关联方候选。"

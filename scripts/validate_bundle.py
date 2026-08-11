@@ -56,6 +56,7 @@ CHECK_NAMES = (
     "dialog_entries",
 )
 TEXT_SUFFIXES = {".py", ".md", ".json", ".jsonl", ".yaml", ".yml", ".txt", ".log"}
+IGNORED_DIRECTORY_NAMES = {".git", ".pytest_cache", "__pycache__"}
 
 
 @dataclass(frozen=True)
@@ -76,7 +77,7 @@ def _relative(path: Path, root: Path) -> str:
 
 def _text_files(root: Path):
     for path in root.rglob("*"):
-        if not path.is_file() or "__pycache__" in path.parts:
+        if not path.is_file() or IGNORED_DIRECTORY_NAMES.intersection(path.parts):
             continue
         if path.suffix.lower() in TEXT_SUFFIXES or path.name == "NOTICE":
             yield path

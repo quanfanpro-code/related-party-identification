@@ -1,6 +1,6 @@
 ---
 name: related-party-identification
-description: Use when a user asks to identify, discover, check, or investigate related parties, hidden related parties, customer or supplier relationships, equity or control links, or CICPA company data for a Chinese audit.
+description: Use when a user asks to identify, discover, check, or investigate related parties, hidden related parties, customer or supplier relationships, equity or control links, or CICPA company data for a Chinese audit. 用于关联方识别与核查，包括隐藏关联方、客户供应商关系、股权控制关系和中注协工商数据。
 ---
 
 <!--
@@ -30,7 +30,7 @@ description: Use when a user asks to identify, discover, check, or investigate r
 |---|---|---|
 | 只有被审计单位名称 | 主动发现 | 确认工商注册全称，从该单位向外寻找候选 |
 | 已有若干公司名称或客户、供应商名单 | 名单核查 | 打开 Windows 文件选择窗口；只接受 XLSX、CSV、TXT 名单，不解析总账或明细账 |
-| 已有注协完整维度导出目录 | 已有数据 | 直接选择目录并核查，跳过登录和联网查询 |
+| 已有注协导出目录 | 已有数据 | 直接选择目录并核查，跳过登录和联网查询 |
 
 信息不够时只问一个自然语言问题，不向用户展示内部参数、子命令或脚本调用。
 
@@ -40,10 +40,10 @@ description: Use when a user asks to identify, discover, check, or investigate r
 2. 每次联网任务都先自动验证现有登录态。有效就直接查询；无效时首选当前用户平时使用的 Firefox。电脑没有 Firefox 时，先推荐 Mozilla 官方安装路线；用户坚持使用 Edge 或 Chrome 时，改走 OpenCLI 浏览器扩展。扩展由本技能从 Gitee 国内镜像的固定版本准备，同事不需要安装 Node、整套 OpenCLI 命令行或另一个浏览器空间。
 3. Firefox 路线直接按 Windows 日常方式打开原有个人配置；Edge/Chrome 路线先确认 OpenCLI 扩展已经启用，再打开用户平时的浏览器和原有个人配置。两条路线都允许浏览器保存的用户名和密码照常使用，不要求关闭已经打开的浏览器，不打开扩展弹窗页面。后台检测到登录成功后继续原任务，不要求用户复制任何技术数据。
 4. 登录失败时按账号权限、验证码、网络连接、会话过期四类说明下一步；不要要求用户接触浏览器内部数据，也不要在对话中索取密码或登录凭据。
-5. 主动发现先对被审计单位做完整维度导出，再按持股比例不低于 20% 扩展候选。初始 2 层；只有用户确认后才继续，最多 5 层。候选超过 100 家时必须暂停，展示数量、主要来源和建议收窄方式，取得确认后再继续。扩展候选不逐家做完整维度导出。
+5. 主动发现先对被审计单位取得本技能固定的 20 个关联方核查维度。先按 10+10 分两批；批量接口连续失败第 1、2 次时仍按原未完成组重试，只有连续第 3 次失败才停止批量并把所有尚未完成的维度改为逐个下载。中间任何一次批量成功都把连续失败次数清零。已经完成或明确无数据的维度不重复下载；单维度仍失败则保留进度并暂停，20 个维度闭环前不得进入候选扩展。闭环后再按持股比例不低于 20% 扩展候选，初始 2 层、最多 5 层，候选超过 100 家时暂停确认。扩展候选不逐家导出 20 个维度。
 6. 名单核查只查询被审计单位和用户明确提供的公司。遇到多个可能的名称列时，列出表头让用户选；不得自行猜测。
 7. 已有数据入口不得创建注协客户端或要求登录。选择目录后直接运行核查，并明确本次结论只覆盖该目录实际包含的数据。
-8. 所有注协请求串行执行：每分钟最多 15 次、每小时最多 300 次；普通查询随机等待 2—5 秒，导出轮询随机等待 10—20 秒。遇到限速提示按等待策略暂停，不并发冲击接口。这里是本技能的保守自我约束，不是注协官方公布限额。
+8. 所有注协请求串行执行：每分钟最多 15 次、每小时最多 300 次；普通查询随机等待 2—5 秒，导出轮询随机等待 10—20 秒，成功批次之间随机等待 15—30 秒。同一时刻只允许一个下载任务在途。遇到限速提示按等待策略暂停，不并发冲击接口。这里是本技能的保守自我约束，不是注协官方公布限额。
 9. 输出后先讲范围，再讲高风险证据、可疑红旗、数据缺口和建议审计程序。客户、供应商表中的“关联方名称”是公开交易关系的对手方名称：公开客户关系、公开供应商关系只作为候选，不能单独形成风险证据，更不能直接写成“关联方”或“未披露”。
 
 ### 🔴 CHECKPOINT / 🛑 STOP
@@ -51,6 +51,7 @@ description: Use when a user asks to identify, discover, check, or investigate r
 - 安装依赖、Firefox 或 OpenCLI 前，先取得用户明确同意；未同意则 🛑 STOP 并保留任务状态。
 - 主动发现超过 2 层或候选超过 100 家时，展示新增范围和来源；未确认则 🛑 STOP。
 - 出现重名主体、多个名称列或不完整导出数据时，先让用户选择或确认影响；未确认则 🛑 STOP。
+- 单维度经过两个完整轮询窗口仍失败，或同名证据文件哈希冲突时，保留全部批次 ZIP 和状态并 🛑 STOP；不得带着数据缺口进入候选扩展。
 - 已有数据入口一旦触发登录或联网，立即 🛑 STOP，返回离线核查入口。
 
 ### 失败恢复
@@ -61,6 +62,7 @@ description: Use when a user asks to identify, discover, check, or investigate r
 | Edge/Chrome 的 OpenCLI 扩展没有在后台连接 | 确认扩展已启用且普通浏览器窗口已打开，再重试一次 | 改为推荐 Firefox；不要打开扩展弹窗页面 |
 | Gitee 扩展文件下载或校验失败 | 保留任务状态，稍后重试同一固定版本 | 改走 Firefox 路线；不要使用未校验文件 |
 | 页面已经登录但官方接口验证仍失败 | 保留任务并重新打开官方页面验证一次 | 停止重复尝试，按账号权限、网络连接或会话过期分流 |
+| 维度批量接口失败 | 连续第 1、2 次仍批量重试未完成组；批量成功则计数清零 | 连续第 3 次失败后，逐个下载所有尚未完成维度；单维度仍失败则暂停并报告具体维度 |
 
 完整逐句引导和异常分流见 `references/user-flow.md`。
 
@@ -80,7 +82,7 @@ description: Use when a user asks to identify, discover, check, or investigate r
 
 ## 核查与交付
 
-使用 `scripts/related_party_workflow.py` 统一编排任务，使用 `scripts/related_party_check.py` 生成核查报告。允许恢复等待中的导出任务，但不得重新上传同一名单或把下载中心“最新任务”误当成本次结果。
+使用 `scripts/related_party_workflow.py` 统一编排任务，使用 `scripts/related_party_check.py` 生成核查报告。新版 20 维任务按状态文件恢复，成功维度不重下；旧版一次请求全部维度的等待任务原样保留，但不在线续跑。任何时候都不得把下载中心“最新任务”误当成本次结果。
 
 主动发现入口把候选链路单独写入 `<公司名称>_主动发现候选清单.xlsx`；它用于说明“为什么查到这家公司”，不是关系认定。核查引擎只对本次实际取得的数据做全图比对。
 
@@ -103,7 +105,7 @@ description: Use when a user asks to identify, discover, check, or investigate r
 
 ## 自包含注协数据层
 
-本技能已经内置搜索、详情、股东、主要人员、股权、子公司发现以及完整维度导出的真实接口，不依赖另一个技能目录。Firefox 登录读取和 Edge/Chrome 的 OpenCLI 本地桥接也已内置；OpenCLI 扩展文件从 Gitee 国内镜像固定版本取得并逐文件校验。客户、供应商、最终受益人和变更记录没有独立查询接口，只能从完整维度导出中取得；主动发现入口只保证被审计单位本身有这类完整数据。客户、供应商文件仅提供公开交易关系中的对手方名称，不能把表头中的“关联方名称”按字面解释为会计准则意义上的关联方。
+本技能已经内置搜索、详情、股东、主要人员、股权、子公司发现以及 20 个关联方核查维度的批量导出和连续三次失败后逐项下载能力，不依赖另一个技能目录。Firefox 登录读取和 Edge/Chrome 的 OpenCLI 本地桥接也已内置；OpenCLI 扩展文件从 Gitee 国内镜像固定版本取得并逐文件校验。客户、供应商、最终受益人和变更记录没有独立查询接口，只能从维度导出批次取得；主动发现入口只保证被审计单位本身取得这 20 个维度。客户、供应商文件仅提供公开交易关系中的对手方名称，不能把表头中的“关联方名称”按字面解释为会计准则意义上的关联方。
 
 完整文件和字段映射见 `references/dimensions.md`；详细规则、阈值和证据分级见 `references/rules.md`。
 
@@ -112,7 +114,7 @@ description: Use when a user asks to identify, discover, check, or investigate r
 - 不要把候选、红旗或自动判断直接写成最终关联方结论；应保留证据和待核实事项。
 - 不要向用户索取密码、Cookie 或浏览器内部数据；登录失效时只走 Firefox 或 Edge/Chrome + OpenCLI 路线。
 - 不要猜测重名主体、公司名称列或用户想查的范围；存在歧义就停下确认。
-- 不要给扩展候选逐家做完整维度导出，也不要绕过 2 层、100 家和每次扩层的确认点。
+- 不要重新走全部维度一次打包下载，不要把已经成功的维度带入重试组；也不要给扩展候选逐家导出 20 个维度或绕过 2 层、100 家和每次扩层的确认点。
 - 不要在已有数据入口触发登录或联网，也不要把缺失维度当成“未发现关系”。
 - 用户没有提供自报关联方名单时，不要使用“未披露”或“披露不完整”定性。
 
@@ -135,7 +137,7 @@ description: Use when a user asks to identify, discover, check, or investigate r
 - `references/user-flow.md` —— 非技术用户逐句引导、异常分流和范围确认
 - `references/rules.md` —— 七类有效核查证据详解（识别原理、具体规则、阈值、红旗信号、监管出处）
 - `references/cases.md` —— 处罚案例库（监管认定的过错 → 对应核查规则）
-- `references/dimensions.md` —— 注协完整维度字段与本技能规则的映射
+- `references/dimensions.md` —— 注协 20 个关联方核查维度与本技能规则的映射
 - `references/SOURCES.json` 与 `NOTICE` —— 内置数据层的来源、基线版本和本地改造说明
 - `scripts/related_party_check.py` —— 核查引擎主脚本
 

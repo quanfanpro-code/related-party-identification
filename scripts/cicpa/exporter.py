@@ -9,15 +9,20 @@
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
+import random
+import shutil
 import tempfile
+import time
 from typing import Any, Callable, Dict, List, Optional
 import unicodedata
 import zipfile
 
 from .client import CicpaClient, CicpaError
+from scripts.state_io import atomic_write_json
 
 
 class ExportError(CicpaError):
@@ -28,8 +33,56 @@ class ExportTaskNotCorrelated(ExportError):
     """下载中心任务无法与本次批次唯一对应。"""
 
 
+class ExportTaskAmbiguous(ExportTaskNotCorrelated):
+    """下载中心同时出现多个可能属于本批次的新任务。"""
+
+
 class ExportValidationError(ExportError):
     """下载文件未通过结构或企业名称验证。"""
+
+
+REQUIRED_DIMENSIONS = (
+    ("S0000002", "基础工商信息"),
+    ("S0000006", "股东信息"),
+    ("S0000103", "最新公示股东"),
+    ("S0000032", "实际控制人"),
+    ("S0000020", "最终受益人"),
+    ("S0000037", "主要人员（高管）"),
+    ("S0000123", "核心团队"),
+    ("S0000104", "对外投资（新）"),
+    ("S0000105", "参控股企业"),
+    ("S0000107", "发票信息"),
+    ("S0000119", "客户"),
+    ("S0000118", "供应商"),
+    ("S0000016", "变更记录"),
+    ("S0000019", "法定代表人变更"),
+    ("S0000018", "经营异常"),
+    ("S0000013", "股权质押"),
+    ("S0000012", "动产抵押"),
+    ("S0000041", "商标"),
+    ("S0000036", "软件著作权"),
+    ("S0000101", "微信公众号"),
+)
+DIMENSION_NAMES = dict(REQUIRED_DIMENSIONS)
+TERMINAL_DIMENSION_RESULTS = {"completed", "no_data"}
+
+
+def initial_dimension_groups() -> List[List[str]]:
+    codes = [code for code, _name in REQUIRED_DIMENSIONS]
+    return [codes[:10], codes[10:]]
+
+
+def next_dimension_group(state: "ExportState") -> List[str]:
+    while state.pending_groups:
+        group = state.pending_groups.pop(0)
+        remaining = [
+            code
+            for code in group
+            if state.dimension_results.get(code) not in TERMINAL_DIMENSION_RESULTS
+        ]
+        if remaining:
+            return remaining
+    return []
 
 
 @dataclass
@@ -47,20 +100,19 @@ class ExportState:
     extract_dir: str = ""
     message_zh: str = ""
     direct_delivery: bool = False
+    required_dimensions: List[str] = field(default_factory=list)
+    dimension_results: Dict[str, str] = field(default_factory=dict)
+    pending_groups: List[List[str]] = field(default_factory=list)
+    active_group: List[str] = field(default_factory=list)
+    batch_history: List[Dict[str, Any]] = field(default_factory=list)
+    poll_windows: int = 0
+    batch_failure_streak: int = 0
+    single_dimension_mode: bool = False
 
 
 def save_export_state(path: Path, state: ExportState) -> None:
     """以不带 BOM 的 UTF-8 原子保存非敏感任务状态。"""
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    text = json.dumps(asdict(state), ensure_ascii=False, indent=2)
-    with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
-        stream.write(text)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, destination)
+    atomic_write_json(path, asdict(state))
 
 
 def load_export_state(path: Path) -> ExportState:
@@ -81,11 +133,15 @@ class CicpaExporter:
         now: Callable[[], str] = lambda: datetime.now().astimezone().strftime(
             "%Y-%m-%d %H:%M"
         ),
+        sleeper: Callable[[float], None] = time.sleep,
+        randint: Callable[[int, int], int] = random.randint,
     ):
         self.client = client
         self.staging_root = Path(staging_root) if staging_root is not None else None
         self.artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
         self._now = now
+        self._sleep = sleeper
+        self._randint = randint
 
     @staticmethod
     def _business_data(payload: Any, alias: str) -> Any:
@@ -168,7 +224,7 @@ class CicpaExporter:
         )
         self._business_data(payload, "触发批量查询")
 
-    def _get_dimensions(self) -> List[str]:
+    def _get_dimension_catalog(self) -> Dict[str, str]:
         payload = self.client.request_json(
             "GET",
             self.ZSK_BASE
@@ -177,15 +233,24 @@ class CicpaExporter:
             cache_key=("export", "dimensions"),
         )
         data = self._business_data(payload, "获取导出维度")
-        dimensions = []
+        dimensions = {}
         for group in data if isinstance(data, list) else []:
             for child in group.get("children", []) if isinstance(group, dict) else []:
                 code = child.get("second_dimension_code") if isinstance(child, dict) else None
                 if code:
-                    dimensions.append(str(code))
+                    name = (
+                        child.get("second_dimension_name")
+                        or child.get("dimension_name")
+                        or child.get("name")
+                        or ""
+                    )
+                    dimensions[str(code)] = str(name)
         if not dimensions:
             raise ExportError("未取得可用导出维度")
         return dimensions
+
+    def _get_dimensions(self) -> List[str]:
+        return list(self._get_dimension_catalog())
 
     def _list_tasks(self, kind: str = "normal") -> List[Dict[str, Any]]:
         payload = self.client.request_json(
@@ -212,33 +277,169 @@ class CicpaExporter:
         return ""
 
     def start_export(self, company_names: List[str], state_path: Path) -> ExportState:
-        """上传名单并触发导出，返回可恢复状态。"""
+        """上传一次名单，初始化 10+10 并触发第一组。"""
         names = self._normalize_names(company_names)
         staging_dir = self._new_staging_dir()
         batch_no = self._upload_companies(names, staging_dir)
         self._trigger_search(batch_no)
-        dimensions = self._get_dimensions()
-        before = self._list_tasks()
-        triggered_at = self._now()
-        task_id = self._trigger_export(batch_no, dimensions)
+        catalog = self._get_dimension_catalog()
+        required = [code for code, _name in REQUIRED_DIMENSIONS]
+        missing = [code for code in required if code not in catalog]
+        if missing:
+            raise ExportError("行业库缺少关联方核查维度：{}".format("、".join(missing)))
+        created_at = self._now()
         state = ExportState(
             batch_no=batch_no,
             company_names=names,
-            created_at=triggered_at,
-            triggered_at=triggered_at,
-            preexisting_task_ids=[
-                str(task.get("task_id"))
-                for task in before
-                if task.get("task_id") is not None
-            ],
+            created_at=created_at,
+            triggered_at="",
             staging_dir=str(staging_dir),
-            task_id=task_id,
             status="waiting",
-            message_zh="完整维度导出已触发，正在等待对应下载任务",
+            message_zh="已初始化 20 个关联方核查维度",
             direct_delivery=self.artifact_dir is not None,
+            required_dimensions=required,
+            pending_groups=initial_dimension_groups(),
         )
         save_export_state(state_path, state)
+        self.trigger_next_group(state, state_path)
         return state
+
+    def trigger_next_group(self, state: ExportState, state_path: Path) -> bool:
+        """在没有活动任务时触发下一组未完成维度。"""
+        if state.active_group or state.task_id:
+            return False
+        while True:
+            group = next_dimension_group(state)
+            if not group:
+                return False
+            state.active_group = group
+            state.triggered_at = self._now()
+            try:
+                before = self._list_tasks()
+                state.preexisting_task_ids = [
+                    str(task.get("task_id"))
+                    for task in before
+                    if task.get("task_id") is not None
+                ]
+                state.task_id = self._trigger_export(state.batch_no, group)
+            except CicpaError as exc:
+                if len(group) > 1 and not state.single_dimension_mode:
+                    self._record_batch_failure(
+                        state,
+                        state_path,
+                        result="trigger_error",
+                        detail=str(exc),
+                    )
+                    continue
+                state.status = "paused"
+                state.message_zh = "单维度 {}（{}）下载请求失败，已暂停：{}".format(
+                    group[0],
+                    DIMENSION_NAMES.get(group[0], group[0]),
+                    exc,
+                )
+                save_export_state(state_path, state)
+                raise
+            state.task_name = ""
+            state.poll_windows = 0
+            state.status = "waiting"
+            state.message_zh = "已触发 {} 个维度，等待下载任务".format(len(group))
+            save_export_state(state_path, state)
+            return True
+
+    @staticmethod
+    def _unfinished_dimensions(state: ExportState) -> List[str]:
+        return [
+            code
+            for code in state.required_dimensions
+            if state.dimension_results.get(code) not in TERMINAL_DIMENSION_RESULTS
+        ]
+
+    def _record_batch_failure(
+        self,
+        state: ExportState,
+        state_path: Path,
+        *,
+        result: str,
+        detail: str = "",
+    ) -> None:
+        """记录连续批量失败；达到三次后只逐项处理尚未完成维度。"""
+        failed_group = [
+            code
+            for code in state.active_group
+            if state.dimension_results.get(code) not in TERMINAL_DIMENSION_RESULTS
+        ]
+        state.batch_failure_streak += 1
+        state.batch_history.append(
+            {
+                "dimensions": list(failed_group),
+                "task_id": state.task_id,
+                "result": result,
+                "detail": detail,
+                "consecutive_batch_failures": state.batch_failure_streak,
+            }
+        )
+        state.active_group = []
+        state.task_id = ""
+        state.task_name = ""
+        state.poll_windows = 0
+        state.status = "waiting"
+        if state.batch_failure_streak >= 3:
+            state.single_dimension_mode = True
+            state.pending_groups = [
+                [code] for code in self._unfinished_dimensions(state)
+            ]
+            state.message_zh = (
+                "批量接口连续失败 3 次，已改为逐个下载尚未完成的维度"
+            )
+        else:
+            existing = {code for code in failed_group}
+            remaining_groups = []
+            for group in state.pending_groups:
+                remaining = [
+                    code
+                    for code in group
+                    if code not in existing
+                    and state.dimension_results.get(code)
+                    not in TERMINAL_DIMENSION_RESULTS
+                ]
+                if remaining:
+                    remaining_groups.append(remaining)
+            state.pending_groups = ([failed_group] if failed_group else []) + remaining_groups
+            state.message_zh = "批量接口连续失败 {}/3，继续批量重试未完成维度".format(
+                state.batch_failure_streak
+            )
+        save_export_state(state_path, state)
+
+    def handle_poll_window_failure(
+        self,
+        state: ExportState,
+        state_path: Path,
+    ) -> None:
+        """批量轮询失败计入连续次数；单维度保留两个轮询窗口。"""
+        state.poll_windows += 1
+        if len(state.active_group) > 1 and not state.single_dimension_mode:
+            self._record_batch_failure(
+                state,
+                state_path,
+                result="poll_timeout",
+            )
+            return
+        if state.poll_windows < 2:
+            state.message_zh = "第一个轮询窗口结束，保留当前维度组继续等待"
+            save_export_state(state_path, state)
+            return
+        if len(state.active_group) == 1:
+            code = state.active_group[0]
+            state.status = "paused"
+            state.message_zh = "单维度 {}（{}）经过两个轮询窗口仍失败，已暂停".format(
+                code,
+                DIMENSION_NAMES.get(code, code),
+            )
+            save_export_state(state_path, state)
+            return
+        state.status = "paused"
+        state.message_zh = "单维度下载经过两个轮询窗口仍失败，已暂停"
+        save_export_state(state_path, state)
 
     @staticmethod
     def correlate_task(
@@ -282,7 +483,7 @@ class CicpaExporter:
         if len(candidates) == 1:
             return candidates[0]
         if len(candidates) > 1:
-            raise ExportTaskNotCorrelated("同时出现多个新下载任务，无法唯一确认本次任务")
+            raise ExportTaskAmbiguous("同时出现多个新下载任务，无法唯一确认本次任务")
         if allow_missing:
             return None
         raise ExportTaskNotCorrelated("尚未发现能与本次批次对应的下载任务")
@@ -301,14 +502,13 @@ class CicpaExporter:
                 self._list_tasks(kind="poll"),
                 allow_missing=True,
             )
-            if task is None:
-                continue
-            state.task_id = str(task.get("task_id") or "")
-            state.task_name = str(task.get("name") or "")
-            state.message_zh = "已关联下载任务，正在等待文件可下载"
-            save_export_state(state_path, state)
-            if task.get("status") == 1:
-                return task
+            if task is not None:
+                state.task_id = str(task.get("task_id") or "")
+                state.task_name = str(task.get("name") or "")
+                state.message_zh = "已关联下载任务，正在等待文件可下载"
+                save_export_state(state_path, state)
+                if task.get("status") == 1:
+                    return task
         state.message_zh = "轮询结束，未发现可唯一对应且已完成的下载任务"
         save_export_state(state_path, state)
         raise ExportTaskNotCorrelated(state.message_zh)
@@ -381,6 +581,316 @@ class CicpaExporter:
                     len(expected), len(actual)
                 )
             )
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _normalize_dimension_name(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", str(value))
+        return "".join(normalized.split()).replace("(", "").replace(")", "")
+
+    @classmethod
+    def _find_dimension_workbook(
+        cls,
+        extract_dir: Path,
+        dimension_name: str,
+    ) -> Optional[Path]:
+        expected = cls._normalize_dimension_name(dimension_name)
+        matches = [
+            path
+            for path in extract_dir.rglob("*.xlsx")
+            if expected in cls._normalize_dimension_name(path.stem)
+        ]
+        if len(matches) > 1:
+            raise ExportValidationError("维度 {} 出现多个工作簿".format(dimension_name))
+        return matches[0] if matches else None
+
+    @classmethod
+    def _validate_dimension_workbook(
+        cls,
+        workbook_path: Path,
+        expected_names: List[str],
+    ) -> str:
+        try:
+            import openpyxl
+        except ImportError as exc:
+            raise ExportValidationError("缺少 openpyxl，无法验证导出文件") from exc
+
+        workbook = openpyxl.load_workbook(
+            workbook_path,
+            read_only=True,
+            data_only=True,
+        )
+        try:
+            sheet = workbook.active
+            sheet.reset_dimensions()
+            rows = list(sheet.iter_rows(values_only=True))
+        finally:
+            workbook.close()
+        data_rows = [row for row in rows[1:] if any(value not in (None, "") for value in row)]
+        if not data_rows:
+            return "no_data"
+        headers = [str(value or "").strip() for value in (rows[0] if rows else [])]
+        name_indexes = [
+            index
+            for index, header in enumerate(headers)
+            if header in {"企业名称", "公司名称", "主体名称", "查询企业名称", "被查询企业名称"}
+            or "被查询企业" in header
+        ]
+        if not name_indexes:
+            raise ExportValidationError(
+                "{} 缺少可核对的被查企业名称列".format(workbook_path.name)
+            )
+        name_index = name_indexes[0]
+        actual = {
+            cls._normalize_company_name(row[name_index])
+            for row in data_rows
+            if len(row) > name_index and row[name_index] not in (None, "")
+        }
+        expected = {cls._normalize_company_name(name) for name in expected_names}
+        if actual != expected:
+            raise ExportValidationError(
+                "{} 的企业集合与本次上传名单不一致".format(workbook_path.name)
+            )
+        return "completed"
+
+    @classmethod
+    def _statistics_no_data_dimensions(
+        cls,
+        extract_dir: Path,
+        expected_names: List[str],
+        dimension_codes: List[str],
+    ) -> set:
+        statistics_path = next(
+            (path for path in extract_dir.rglob("*.xlsx") if path.stem == "统计表"),
+            None,
+        )
+        if statistics_path is None:
+            return set()
+        try:
+            import openpyxl
+        except ImportError as exc:
+            raise ExportValidationError("缺少 openpyxl，无法验证统计表") from exc
+        workbook = openpyxl.load_workbook(
+            statistics_path,
+            read_only=True,
+            data_only=True,
+        )
+        try:
+            sheet = workbook.active
+            sheet.reset_dimensions()
+            rows = list(sheet.iter_rows(values_only=True))
+        finally:
+            workbook.close()
+        header_index = next(
+            (
+                index
+                for index, row in enumerate(rows)
+                if row and str(row[0] or "").strip() == "公司名称"
+            ),
+            None,
+        )
+        if header_index is None:
+            return set()
+        headers = [str(value or "").strip() for value in rows[header_index]]
+        data_rows = [
+            row
+            for row in rows[header_index + 1 :]
+            if row and row[0] not in (None, "")
+        ]
+        expected = {cls._normalize_company_name(name) for name in expected_names}
+        actual = {cls._normalize_company_name(row[0]) for row in data_rows}
+        if actual != expected:
+            raise ExportValidationError("统计表企业集合与本次上传名单不一致")
+        no_data = set()
+        for code in dimension_codes:
+            name = DIMENSION_NAMES.get(code, code)
+            try:
+                column = headers.index(name)
+            except ValueError:
+                continue
+            values = [row[column] for row in data_rows if len(row) > column]
+            if values and all(
+                value not in (None, "") and float(value) == 0 for value in values
+            ):
+                no_data.add(code)
+        return no_data
+
+    def download_current_group(
+        self,
+        state: ExportState,
+        task: Dict[str, Any],
+        state_path: Path,
+    ) -> List[str]:
+        """逐维保留本批有效结果，只重排缺失维度。"""
+        url = str(task.get("url") or "")
+        if not url:
+            raise ExportValidationError("对应下载任务没有下载地址")
+        if not url.startswith("http"):
+            url = self.ZSK_BASE + "/" + url.lstrip("/")
+        staging_dir = Path(state.staging_dir)
+        batch_root = staging_dir / "dimension-batches"
+        batch_root.mkdir(parents=True, exist_ok=True)
+        batch_number = len(state.batch_history) + 1
+        archive_path = batch_root / "batch-{:03d}.zip".format(batch_number)
+        extract_dir = batch_root / "batch-{:03d}_files".format(batch_number)
+        while archive_path.exists() or extract_dir.exists():
+            batch_number += 1
+            archive_path = batch_root / "batch-{:03d}.zip".format(batch_number)
+            extract_dir = batch_root / "batch-{:03d}_files".format(batch_number)
+        archive_path.write_bytes(self.client.request_bytes("GET", url, timeout=120))
+        if not zipfile.is_zipfile(archive_path):
+            state.status = "paused"
+            state.message_zh = "本批下载内容不是有效 ZIP"
+            save_export_state(state_path, state)
+            raise ExportValidationError(state.message_zh)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self._safe_extract(archive_path, extract_dir)
+        except ExportValidationError as exc:
+            state.status = "paused"
+            state.message_zh = str(exc)
+            save_export_state(state_path, state)
+            raise
+
+        completed = []
+        missing = []
+        try:
+            explicit_no_data = self._statistics_no_data_dimensions(
+                extract_dir,
+                state.company_names,
+                state.active_group,
+            )
+        except (ExportValidationError, TypeError, ValueError) as exc:
+            state.status = "paused"
+            state.message_zh = str(exc)
+            save_export_state(state_path, state)
+            raise ExportValidationError(state.message_zh) from exc
+        for code in state.active_group:
+            if state.dimension_results.get(code) in TERMINAL_DIMENSION_RESULTS:
+                continue
+            name = DIMENSION_NAMES.get(code, code)
+            try:
+                workbook_path = self._find_dimension_workbook(extract_dir, name)
+            except ExportValidationError as exc:
+                state.status = "paused"
+                state.message_zh = str(exc)
+                save_export_state(state_path, state)
+                raise
+            if workbook_path is None:
+                if code in explicit_no_data:
+                    state.dimension_results[code] = "no_data"
+                    completed.append(code)
+                else:
+                    missing.append(code)
+                continue
+            try:
+                result = self._validate_dimension_workbook(
+                    workbook_path,
+                    state.company_names,
+                )
+            except ExportValidationError as exc:
+                state.status = "paused"
+                state.message_zh = str(exc)
+                save_export_state(state_path, state)
+                raise
+            target = staging_dir / workbook_path.name
+            if target.exists():
+                if self._file_sha256(target) != self._file_sha256(workbook_path):
+                    state.status = "paused"
+                    state.message_zh = "{} 与既有证据内容冲突，未覆盖旧文件".format(
+                        workbook_path.name
+                    )
+                    state.batch_history.append(
+                        {
+                            "dimensions": list(state.active_group),
+                            "task_id": str(task.get("task_id") or state.task_id),
+                            "archive_path": str(archive_path),
+                            "result": "file_conflict",
+                        }
+                    )
+                    save_export_state(state_path, state)
+                    raise ExportValidationError(state.message_zh)
+            else:
+                shutil.copy2(workbook_path, target)
+            state.dimension_results[code] = result
+            completed.append(code)
+
+        state.batch_history.append(
+            {
+                "dimensions": list(state.active_group),
+                "task_id": str(task.get("task_id") or state.task_id),
+                "archive_path": str(archive_path),
+                "completed_dimensions": list(completed),
+                "missing_dimensions": list(missing),
+                "result": "partial" if missing else "completed",
+            }
+        )
+        if len(state.active_group) > 1 and not state.single_dimension_mode:
+            state.batch_failure_streak = 0
+        if missing:
+            state.pending_groups.insert(0, missing)
+        state.active_group = []
+        state.task_id = ""
+        state.task_name = ""
+        state.poll_windows = 0
+        state.archive_path = str(archive_path)
+        state.extract_dir = str(staging_dir)
+        finished = all(
+            state.dimension_results.get(code) in TERMINAL_DIMENSION_RESULTS
+            for code in state.required_dimensions
+        )
+        state.status = "completed" if finished else "waiting"
+        state.message_zh = (
+            "20 个关联方核查维度已全部完成"
+            if finished
+            else "本批已保留 {} 个维度，仅继续未完成维度".format(len(completed))
+        )
+        save_export_state(state_path, state)
+        return completed
+
+    def run_to_completion(
+        self,
+        state: ExportState,
+        state_path: Path,
+        *,
+        max_polls: int = 18,
+    ) -> Path:
+        """串行驱动全部未完成维度，只有 20 维闭环后才返回。"""
+        while True:
+            if state.status == "paused":
+                raise ExportError(state.message_zh or "维度导出已暂停")
+            finished = bool(state.required_dimensions) and all(
+                state.dimension_results.get(code) in TERMINAL_DIMENSION_RESULTS
+                for code in state.required_dimensions
+            )
+            if finished:
+                state.status = "completed"
+                state.extract_dir = state.extract_dir or state.staging_dir
+                state.message_zh = "20 个关联方核查维度已全部完成"
+                save_export_state(state_path, state)
+                return Path(state.extract_dir)
+            if not state.active_group and not self.trigger_next_group(state, state_path):
+                raise ExportError("仍有未完成维度，但没有可触发的维度组")
+            try:
+                task = self.wait_for_task(state, state_path, max_polls=max_polls)
+            except ExportTaskAmbiguous as exc:
+                state.status = "paused"
+                state.message_zh = str(exc)
+                save_export_state(state_path, state)
+                raise
+            except ExportTaskNotCorrelated:
+                self.handle_poll_window_failure(state, state_path)
+                continue
+            self.download_current_group(state, task, state_path)
+            if state.status != "completed":
+                self._sleep(self._randint(15, 30))
 
     def download_and_validate(
         self,
