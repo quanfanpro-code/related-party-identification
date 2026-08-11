@@ -37,6 +37,7 @@ from scripts.cicpa.auth import (
 )
 from scripts.cicpa.exporter import (
     CicpaExporter,
+    ExportError,
     ExportState,
     load_export_state,
 )
@@ -50,6 +51,7 @@ from scripts.discovery import (
     SeedExportCandidate,
     discover,
 )
+from scripts.state_io import atomic_write_json
 
 
 DEPENDENCIES = ("requests", "openpyxl")
@@ -99,16 +101,7 @@ class WorkflowResult:
 
 def save_task_state(path: Path, state: TaskState) -> None:
     """以不带 BOM 的 UTF-8 原子保存非敏感任务状态。"""
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    text = json.dumps(asdict(state), ensure_ascii=False, indent=2)
-    with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
-        stream.write(text)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, destination)
+    atomic_write_json(path, asdict(state))
 
 
 def load_task_state(path: Path) -> TaskState:
@@ -533,8 +526,13 @@ def _ensure_export(state, state_path, exporter, company_names) -> Path:
         export_state = load_export_state(export_state_path)
         if export_state.status == "completed" and Path(export_state.extract_dir).is_dir():
             return Path(export_state.extract_dir)
-        if export_state.status == "failed":
-            raise RuntimeError(export_state.message_zh or "上次导出验证失败")
+        if not export_state.required_dimensions:
+            export_state_path = Path(state_path).with_name(
+                "{}-adaptive-export-state.json".format(state.task_id)
+            )
+            state.export_state_path = str(export_state_path)
+            save_task_state(state_path, state)
+            export_state = exporter.start_export(company_names, export_state_path)
     else:
         export_state_path = Path(state_path).with_name(
             "{}-export-state.json".format(state.task_id)
@@ -542,8 +540,15 @@ def _ensure_export(state, state_path, exporter, company_names) -> Path:
         state.export_state_path = str(export_state_path)
         save_task_state(state_path, state)
         export_state = exporter.start_export(company_names, export_state_path)
-    task = exporter.wait_for_task(export_state, export_state_path)
-    return exporter.download_and_validate(export_state, task, export_state_path)
+    return exporter.run_to_completion(export_state, export_state_path)
+
+
+def _pause_export(state: TaskState, state_path: Path, error: ExportError) -> WorkflowResult:
+    state.stage = "paused_export"
+    state.status = "paused_export"
+    state.message_zh = str(error)
+    save_task_state(state_path, state)
+    return WorkflowResult(state.status, state.message_zh)
 
 
 def _write_candidate_report(path: Path, discovery_result) -> None:
@@ -650,18 +655,24 @@ def run_workflow(
                     candidate_count=state.candidate_count,
                     rejected_inputs=state.rejected_inputs,
                 )
-            data_dir = _ensure_export(state, state_file, exporter, names)
+            try:
+                data_dir = _ensure_export(state, state_file, exporter, names)
+            except ExportError as exc:
+                return _pause_export(state, state_file, exc)
             state.report_paths = list(
                 dict.fromkeys(state.report_paths + [str(data_dir)])
             )
             candidate_count = len(names) - 1
         else:
-            data_dir = _ensure_export(
-                state,
-                state_file,
-                exporter,
-                [state.audited_entity],
-            )
+            try:
+                data_dir = _ensure_export(
+                    state,
+                    state_file,
+                    exporter,
+                    [state.audited_entity],
+                )
+            except ExportError as exc:
+                return _pause_export(state, state_file, exc)
             state.report_paths = list(
                 dict.fromkeys(state.report_paths + [str(data_dir)])
             )

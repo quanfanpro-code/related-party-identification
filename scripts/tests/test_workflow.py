@@ -23,7 +23,7 @@ import zipfile
 
 import openpyxl
 
-from scripts.cicpa.exporter import ExportState, save_export_state
+from scripts.cicpa.exporter import ExportError, ExportState, save_export_state
 from scripts.discovery import Candidate, DiscoveryResult
 from scripts.related_party_workflow import (
     TaskState,
@@ -472,6 +472,7 @@ class FakeExporter:
     def __init__(self, extract_dir):
         self.extract_dir = Path(extract_dir)
         self.start_calls = []
+        self.run_calls = []
         self.wait_calls = []
         self.download_calls = []
 
@@ -484,9 +485,21 @@ class FakeExporter:
             triggered_at="2026-07-26 16:00",
             staging_dir=str(Path(state_path).parent),
             status="waiting",
+            required_dimensions=["S0000002"],
+            pending_groups=[["S0000002"]],
         )
         save_export_state(state_path, state)
         return state
+
+    def run_to_completion(self, state, state_path, max_polls=18):
+        self.run_calls.append(state.batch_no)
+        state.dimension_results = {
+            code: "completed" for code in state.required_dimensions
+        }
+        state.status = "completed"
+        state.extract_dir = str(self.extract_dir)
+        save_export_state(state_path, state)
+        return self.extract_dir
 
     def wait_for_task(self, state, state_path, max_polls=18):
         self.wait_calls.append(state.batch_no)
@@ -760,7 +773,7 @@ class WorkflowModeTests(unittest.TestCase):
             "甲公司_关联方核查报告_20260726_120000_2.xlsx",
         )
 
-    def test_恢复等待中的导出不会再次上传名单(self):
+    def test_旧版等待状态原样保留并另起二十维导出(self):
         artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_resume_export_"))
         data_dir = artifact_dir / "exported_files"
         data_dir.mkdir()
@@ -778,6 +791,7 @@ class WorkflowModeTests(unittest.TestCase):
                 status="waiting",
             ),
         )
+        old_state_bytes = export_state_path.read_bytes()
         exporter = FakeExporter(data_dir)
         checker = FakeChecker()
         state_path = artifact_dir / "task.json"
@@ -799,8 +813,49 @@ class WorkflowModeTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "completed")
-        self.assertEqual(exporter.start_calls, [])
-        self.assertEqual(exporter.wait_calls, ["batch-existing"])
+        self.assertEqual(exporter.start_calls, [["甲公司", "乙公司"]])
+        self.assertEqual(exporter.run_calls, ["batch-1"])
+        self.assertEqual(exporter.wait_calls, [])
+        self.assertEqual(export_state_path.read_bytes(), old_state_bytes)
+        self.assertNotEqual(Path(state.export_state_path), export_state_path)
+        self.assertTrue(state.export_state_path.endswith("-adaptive-export-state.json"))
+
+    def test_二十维未闭环时暂停且不进入候选扩展(self):
+        artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_export_gate_"))
+        data_dir = artifact_dir / "甲公司_注协原始导出"
+        data_dir.mkdir()
+        exporter = FakeExporter(data_dir)
+        checker = FakeChecker()
+        discovery_calls = []
+
+        def pause_export(state, state_path, max_polls=18):
+            state.status = "paused"
+            state.message_zh = "单维度 S0000002 失败，已暂停"
+            save_export_state(state_path, state)
+            raise ExportError(state.message_zh)
+
+        exporter.run_to_completion = pause_export
+        state_path = artifact_dir / "task.json"
+        state = TaskState(
+            task_id="gate-1",
+            mode="discovery",
+            audited_entity="甲公司",
+            output_dir=str(artifact_dir),
+        )
+
+        result = run_workflow(
+            state,
+            state_path,
+            client_factory=lambda: object(),
+            exporter_factory=lambda _client: exporter,
+            discoverer=lambda *_args, **_kwargs: discovery_calls.append(1),
+            checker=checker,
+        )
+
+        self.assertEqual(result.status, "paused_export")
+        self.assertEqual(discovery_calls, [])
+        self.assertEqual(checker.calls, [])
+        self.assertIn("S0000002", result.message_zh)
 
 
 class SkillDocumentationContractTests(unittest.TestCase):
@@ -990,6 +1045,38 @@ class BundleValidationTests(unittest.TestCase):
         ]:
             with self.subTest(check=check):
                 self.assertTrue(report.checks[check])
+
+    def test_缓存目录不参与分发编码校验(self):
+        artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_bundle_cache_"))
+        bundle = artifact_dir / "bundle"
+        shutil.copytree(
+            self.skill_root,
+            bundle,
+            ignore=shutil.ignore_patterns(".pytest_cache", "__pycache__"),
+        )
+        cache_file = bundle / ".pytest_cache" / "README.md"
+        cache_file.parent.mkdir()
+        cache_file.write_text("pytest cache", encoding="utf-8")
+
+        report = validate_bundle(bundle, test_runner=self._passing_tests)
+
+        self.assertTrue(report.checks["encoding"], report.errors)
+
+    def test_普通目录无_bom_中文文档仍被编码校验拦截(self):
+        artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_bundle_encoding_"))
+        bundle = artifact_dir / "bundle"
+        shutil.copytree(
+            self.skill_root,
+            bundle,
+            ignore=shutil.ignore_patterns(".pytest_cache", "__pycache__"),
+        )
+        bad_file = bundle / "references" / "bad-encoding.md"
+        bad_file.write_text("普通交付文档", encoding="utf-8")
+
+        report = validate_bundle(bundle, test_runner=self._passing_tests)
+
+        self.assertFalse(report.checks["encoding"])
+        self.assertIn("references/bad-encoding.md", "\n".join(report.errors))
 
     def test_外部路径和模拟明文凭据会指出具体文件(self):
         artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_bundle_bad_"))
