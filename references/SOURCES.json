@@ -7,8 +7,8 @@
       "author": "nigo",
       "repository": "https://github.com/nigo81/nigo-skills",
       "source_path": "cicpa-company-query",
-      "baseline_commit": "0657de949b42b5177a7e2a9a1f9c19b5deac926a",
-      "baseline_verified_at": "2026-07-26",
+      "baseline_commit": "64682115565072d1db79a5f29615dd3fdc7f6174",
+      "baseline_verified_at": "2026-09-04",
       "license_evidence": {
         "type": "repository README declaration",
         "value": "MIT",
@@ -19,8 +19,8 @@
       "source_snapshot": [
         {
           "path": "cicpa-company-query/SKILL.md",
-          "sha256": "972040df108baa17dd44bb4e6e12b98db624d8a2cd1ec7df3004997899589167",
-          "git_blob": "637b030355293783e360edc485633033dbf8f6a4"
+          "sha256": "b770d78be02c4c8f6b4c6f4b5869cbb88c2b531ee68b2ac36cf94993c4d948e2",
+          "git_blob": "7db8138e6f77775d7cb9fc215bd27704c694a814"
         },
         {
           "path": "cicpa-company-query/scripts/cicpa_query.py",
