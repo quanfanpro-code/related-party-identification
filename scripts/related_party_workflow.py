@@ -26,15 +26,15 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.cicpa.auth import (
-    CredentialStore,
-    _client_from_cookies,
-    default_cookie_verifier,
+    auth_status as _bridge_auth_status,
     default_browser_profile_path,
     default_status_path,
     detect_browser,
     read_login_status,
     start_guided_login,
 )
+from scripts.cicpa.browser_transport import OpenCliTransport
+from scripts.cicpa.client import CicpaClient
 from scripts.cicpa.exporter import (
     CicpaExporter,
     ExportError,
@@ -110,28 +110,11 @@ def load_task_state(path: Path) -> TaskState:
     return TaskState(**payload)
 
 
-def auth_status(
-    *,
-    store=None,
-    verifier: Callable[[Dict[str, str]], bool] = default_cookie_verifier,
-) -> Dict[str, str]:
-    """读取 DPAPI 状态后再用官方轻量接口验证，不返回认证内容。"""
-    credential_store = store or CredentialStore()
-    try:
-        cookies = credential_store.load_cookies()
-    except Exception:
-        return {
-            "status": "failed",
-            "message_zh": "认证状态无法读取，可以重新启动登录流程",
-        }
-    if not cookies:
-        return {"status": "idle", "message_zh": "尚未保存登录状态"}
-    if verifier(cookies):
-        return {"status": "authenticated", "message_zh": "现有登录状态有效"}
-    return {
-        "status": "expired",
-        "message_zh": "现有登录状态已失效，需要重新登录",
-    }
+def auth_status(*, bridge_factory=None) -> Dict[str, str]:
+    """实时验证 Edge 内注协会话;不读取、不返回任何凭据。"""
+    if bridge_factory is None:
+        return _bridge_auth_status()
+    return _bridge_auth_status(bridge_factory=bridge_factory)
 
 
 def ensure_login(
@@ -200,17 +183,16 @@ def preflight(
     elif not browser:
         result["status"] = "needs_browser"
         result["message_zh"] = (
-            "未检测到 Firefox、Microsoft Edge 或 Google Chrome。"
-            "推荐从 Mozilla 官方页面安装 Firefox。"
+            "未检测到 Microsoft Edge 或 Google Chrome。"
+            "本技能统一走 OpenCLI 驱动 Edge 的路线,请使用 Microsoft Edge。"
         )
     elif browser.get("name") in {"Microsoft Edge", "Google Chrome"} and not opencli_checker(
         default_browser_profile_path(browser_name=str(browser["name"]))
     ):
         result["status"] = "needs_opencli_extension"
         result["message_zh"] = (
-            "推荐使用 Firefox，步骤最少；若继续使用 Edge 或 Chrome，"
-            "需要一次性安装 OpenCLI 浏览器扩展。"
-            "取得同意后可从 Gitee 国内镜像自动准备扩展并打开安装页面。"
+            "需要一次性准备 OpenCLI:Edge 扩展(可从 Gitee 国内镜像自动准备)"
+            "和 opencli 命令行工具。取得同意后技能会打开安装引导页面。"
         )
     elif login.get("status") != "authenticated":
         result["status"] = "ready_to_login"
@@ -230,7 +212,7 @@ def setup_opencli(
     if not selected or selected.get("name") not in {"Microsoft Edge", "Google Chrome"}:
         return {
             "status": "not_applicable",
-            "message_zh": "OpenCLI 安装只用于 Edge 或 Chrome；推荐直接使用 Firefox。",
+            "message_zh": "OpenCLI 安装只用于 Edge 或 Chrome;Firefox 不在本技能路线内。",
         }
     extension_dir = downloader()
     guide_opener(selected, extension_dir)
@@ -467,13 +449,10 @@ def extract_seed_export_candidates(data_dir) -> List[SeedExportCandidate]:
 
 
 def _default_client_factory():
-    store = CredentialStore()
-    cookies = store.load_cookies()
-    if not cookies:
-        raise RuntimeError("尚未登录，需要先在注协官方页面完成登录")
-    if not default_cookie_verifier(cookies):
-        raise RuntimeError("登录状态已失效，需要重新登录")
-    return _client_from_cookies(cookies)
+    status = _bridge_auth_status()
+    if status.get("status") != "authenticated":
+        raise RuntimeError("Edge 内注协会话无效，需要先完成登录")
+    return CicpaClient(session=OpenCliTransport())
 
 
 def _default_checker(**kwargs):
@@ -763,10 +742,8 @@ def main(argv=None) -> int:
         choices=["edge", "chrome"],
         default="edge",
     )
-    login_parser = subparsers.add_parser("login-start", help="打开可见浏览器登录")
-    login_parser.add_argument(
-        "--browser",
-        choices=["firefox", "edge", "chrome"],
+    login_parser = subparsers.add_parser(
+        "login-start", help="在 Edge 中打开注协登录页并等待登录"
     )
     subparsers.add_parser("login-status", help="读取后台登录进度")
     run_parser = subparsers.add_parser("run", help="运行关联方识别任务")
@@ -800,12 +777,7 @@ def main(argv=None) -> int:
             browser=detect_browser(preferred_name=browser_name)
         )
     elif args.command == "login-start":
-        browser_name = {
-            "firefox": "Mozilla Firefox",
-            "edge": "Microsoft Edge",
-            "chrome": "Google Chrome",
-        }.get(args.browser)
-        payload = start_guided_login(browser_name=browser_name)
+        payload = start_guided_login()
     elif args.command == "login-status":
         payload = read_login_status(default_status_path())
     elif args.command == "run":

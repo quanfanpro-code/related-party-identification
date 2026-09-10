@@ -18,18 +18,20 @@ import sys
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.cicpa.auth import CredentialStore, _client_from_cookies
+from scripts.cicpa.auth import auth_status
+from scripts.cicpa.browser_transport import OpenCliTransport
+from scripts.cicpa.client import CicpaClient
 from scripts.discovery import DiscoveryPolicy, discover
 
 
 def penetrate(target, threshold=20.0, max_depth=2):
     """调用统一发现引擎并返回旧入口需要的列表结构。"""
-    cookies = CredentialStore().load_cookies()
-    if not cookies:
+    status = auth_status()
+    if status.get("status") != "authenticated":
         raise RuntimeError("尚未登录，请先通过 AI 对话启动注协官方登录流程")
     result = discover(
         target,
-        client=_client_from_cookies(cookies),
+        client=CicpaClient(session=OpenCliTransport()),
         policy=DiscoveryPolicy(equity_threshold=threshold),
         approved_depth=max_depth,
     )

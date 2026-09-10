@@ -34,7 +34,7 @@
 
 ### 🟡 改编自 OpenCLI（Apache-2.0）
 
-`scripts/cicpa/edge_bridge.py`、`opencli_setup.py`、`read_browser_cookies.ps1` 改编自 [jackwener/OpenCLI](https://gitee.com/github_dep/opencli)（Apache-2.0 协议）。
+`scripts/cicpa/opencli_setup.py` 改编自 [jackwener/OpenCLI](https://gitee.com/github_dep/opencli)（Apache-2.0 协议）。
 
 这部分保留 Apache-2.0 协议，你可以随便用，但不能拿我的专利告我。
 
@@ -64,11 +64,10 @@ related-party-identification/
 │   ├── validate_bundle.py         ← 完整性校验
 │   ├── cicpa/
 │   │   ├── client.py              ← 注协查询客户端（MIT）
-│   │   ├── auth.py                ← 注协登录凭据管理（MIT）
+│   │   ├── auth.py                ← 登录编排与会话验证（MIT）
 │   │   ├── exporter.py            ← 20 维批量及连续失败转逐项导出器（MIT）
-│   │   ├── edge_bridge.py         ← Edge/Chrome 登录桥接（Apache-2.0）
-│   │   ├── opencli_setup.py       ← OpenCLI 扩展安装引导（Apache-2.0）
-│   │   └── read_browser_cookies.ps1  ← Cookie 读取（Apache-2.0）
+│   │   ├── browser_transport.py   ← OpenCLI 页面取数通道（Apache-2.0）
+│   │   └── opencli_setup.py       ← OpenCLI 扩展安装引导（Apache-2.0）
 │   └── tests/                    ← 自动化测试
 ├── references/
 │   ├── SOURCES.json          ← 上游来源追踪记录
@@ -84,7 +83,7 @@ related-party-identification/
 本工具是一个 **纯本地的 AI 技能包**：
 - ❌ 不上传你的代码或数据到任何服务器
 - ❌ 不保存你的注协账号密码
-- ❌ 登录态仅保存在当前 Windows 用户本地加密存储
+- ❌ 不保存任何 Cookie 或登录凭据（登录态就是 Edge 浏览器里的会话本身）
 - ❌ 日志和报告中不输出任何登录内容
 - ⚠️ 审计底稿和核查报告请自行妥善保管
 
@@ -209,19 +208,18 @@ $related-party-identification
 每次调用都会先检查当前登录是否还能使用：
 
 - 登录有效：直接查询，不让您重复登录；
-- 登录失效：打开您平时使用的浏览器，请您正常登录；
+- 登录失效：通过 OpenCLI 在 Edge 中打开注协登录页，请您正常登录；
 - 已有数据离线核查：完全跳过登录和联网。
 
 技能不会因为"上次登录过"就盲目认为一直有效，而是每次实际检查。
 
-### 第四步：需要登录时使用您平时的浏览器
+### 第四步：需要登录时在 Edge 中完成
 
-推荐顺序是：
+本技能的浏览器路线只有一条：**OpenCLI 驱动 Microsoft Edge**（2026-09 起 Firefox 路线已退役）。
 
-1. Firefox，步骤最少；
-2. Edge 或 Chrome，通过 OpenCLI 浏览器扩展连接。
+OpenCLI 指 opencli 命令行工具及其 Edge 扩展：命令行工具是一次性安装依赖，扩展可由技能从 Gitee 国内镜像的固定版本自动准备。登录页由 opencli 在 Edge 中打开，与系统默认浏览器无关。
 
-技能使用当前 Windows 用户平时的浏览器和原有个人配置。浏览器里已经保存的用户名和密码可以照常使用，不会另开一个没有个性化设置的空白浏览器。
+技能使用当前 Windows 用户平时的 Edge 和原有个人配置。浏览器里已经保存的用户名和密码可以照常使用，不会另开一个没有个性化设置的空白浏览器。登录验证在页面上下文完成，技能不提取 Cookie、不保存任何凭据。
 
 ### 第五步：取得本次需要的数据
 

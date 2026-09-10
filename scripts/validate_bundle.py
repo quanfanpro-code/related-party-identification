@@ -40,7 +40,7 @@ REQUIRED_FILES = (
     "scripts/validate_bundle.py",
     "scripts/cicpa/auth.py",
     "scripts/cicpa/client.py",
-    "scripts/cicpa/edge_bridge.py",
+    "scripts/cicpa/browser_transport.py",
     "scripts/cicpa/exporter.py",
     "scripts/cicpa/opencli_setup.py",
 )

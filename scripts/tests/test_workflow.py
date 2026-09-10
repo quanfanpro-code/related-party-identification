@@ -72,6 +72,16 @@ class FakeFileDialog:
         return self.directory_result
 
 
+class FakeBridge:
+    """模拟 opencli 页面桥的验证结果。"""
+
+    def __init__(self, *, verify=True):
+        self.verify = verify
+
+    def verify_session(self):
+        return self.verify
+
+
 class FakeStore:
     def __init__(self, cookies=None, error=None):
         self.cookies = cookies or {}
@@ -140,7 +150,7 @@ class PreflightTests(unittest.TestCase):
         self.assertNotIn("password", serialized)
         self.assertNotIn("authorization", serialized)
 
-    def test_edge_未安装_opencli_时先推荐_firefox_再给安装路线(self):
+    def test_edge_未安装_opencli_时给出一次性安装路线(self):
         result = preflight(
             platform_name="nt",
             version_info=(3, 11, 0),
@@ -155,11 +165,9 @@ class PreflightTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "needs_opencli_extension")
-        self.assertLess(
-            result["message_zh"].index("Firefox"),
-            result["message_zh"].index("OpenCLI"),
-        )
+        self.assertIn("OpenCLI", result["message_zh"])
         self.assertIn("Gitee 国内镜像", result["message_zh"])
+        self.assertNotIn("Firefox", result["message_zh"])
 
     def test_opencli_安装准备只让用户先做一个动作(self):
         extension_dir = Path(tempfile.mkdtemp(prefix="rpi_opencli_extension_"))
@@ -238,20 +246,14 @@ class TaskStateTests(unittest.TestCase):
 
 
 class AuthenticationStatusTests(unittest.TestCase):
-    def test_已有加密状态仍以官方接口验证结果为准(self):
-        result = auth_status(
-            store=FakeStore({"cicpa_token": "secret"}),
-            verifier=lambda _cookies: True,
-        )
+    def test_浏览器会话有效即视为已登录(self):
+        result = auth_status(bridge_factory=lambda **kw: FakeBridge(verify=True))
 
         self.assertEqual(result["status"], "authenticated")
         self.assertEqual(set(result), {"status", "message_zh"})
 
-    def test_失效状态不回显_cookie(self):
-        result = auth_status(
-            store=FakeStore({"cicpa_token": "secret"}),
-            verifier=lambda _cookies: False,
-        )
+    def test_失效状态不回显任何凭据(self):
+        result = auth_status(bridge_factory=lambda **kw: FakeBridge(verify=False))
         serialized = json.dumps(result, ensure_ascii=False).lower()
 
         self.assertEqual(result["status"], "expired")
@@ -882,7 +884,7 @@ class SkillDocumentationContractTests(unittest.TestCase):
             "每分钟最多 15 次",
             "每小时最多 300 次",
             "候选超过 100 家",
-            "只保存到当前 Windows 用户",
+            "不保存任何凭据",
             "不等于最终关联方结论",
         ]
         for phrase in required_phrases:

@@ -111,7 +111,7 @@ class UpstreamCheckTests(unittest.TestCase):
                             "git_blob": git_blob_text(source_text),
                         }
                     ],
-                    "local_modules": ["scripts/cicpa/edge_bridge.py"],
+                    "local_modules": ["scripts/cicpa/browser_transport.py"],
                 }
             ],
         }
