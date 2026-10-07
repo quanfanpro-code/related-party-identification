@@ -11,6 +11,7 @@
 
 from collections import deque
 from dataclasses import dataclass
+import math
 import random
 import time
 from typing import Any, Callable, Deque, Dict, Hashable, List, Optional, Tuple
@@ -63,7 +64,7 @@ class CompanyDetail:
 @dataclass(frozen=True)
 class Shareholder:
     name: str
-    ratio: float = 0.0
+    ratio: Optional[float] = None
     org_id: str = ""
 
 
@@ -77,7 +78,7 @@ class KeyPerson:
 class EquityEdge:
     company_id: str
     company_name: str
-    ratio: float
+    ratio: Optional[float]
     direction: str
 
 
@@ -287,12 +288,13 @@ class CicpaClient:
         return ""
 
     @classmethod
-    def _ratio(cls, item: Dict[str, Any], *keys: str) -> float:
+    def _ratio(cls, item: Dict[str, Any], *keys: str) -> Optional[float]:
         raw = cls._text(item, *keys).replace("%", "").replace(",", "")
         try:
-            return float(raw)
+            value = float(raw)
+            return value if math.isfinite(value) and 0 <= value <= 100 else None
         except (TypeError, ValueError):
-            return 0.0
+            return None
 
     @staticmethod
     def _business_data(payload: Any, alias: str) -> Any:
@@ -467,7 +469,7 @@ class CicpaClient:
                         EquityEdge(
                             company_id=company.org_id,
                             company_name=company.name,
-                            ratio=self._ratio(item, "investRatio", "ratio", "czbl"),
+                            ratio=self._ratio(item, "czbl", "investRatio", "ratio"),
                             direction=direction,
                         )
                     )

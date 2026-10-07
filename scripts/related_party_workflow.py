@@ -12,7 +12,7 @@
 
 import argparse
 import csv
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
 import importlib.util
 import json
@@ -78,6 +78,11 @@ class TaskState:
     disclosed_parties: List[str] = field(default_factory=list)
     report_paths: List[str] = field(default_factory=list)
     candidate_count: int = 0
+    candidate_export_state_path: str = ""
+    candidate_records: List[dict] = field(default_factory=list)
+    discovery_completed: bool = False
+    discovery_warnings: List[str] = field(default_factory=list)
+    raw_export_dir: str = ""
 
 
 @dataclass
@@ -404,7 +409,7 @@ def extract_seed_export_candidates(data_dir) -> List[SeedExportCandidate]:
     except ImportError:
         return []
     candidates = []
-    seen = set()
+    seen = {}
     for filename, relation_type in (
         ("客户.xlsx", "公开客户关系"),
         ("供应商.xlsx", "公开供应商关系"),
@@ -415,6 +420,7 @@ def extract_seed_export_candidates(data_dir) -> List[SeedExportCandidate]:
         workbook = openpyxl.load_workbook(path, data_only=True)
         try:
             rows = list(workbook.active.iter_rows(values_only=True))
+            sheet_name = workbook.active.title
         finally:
             workbook.close()
         if not rows:
@@ -428,7 +434,7 @@ def extract_seed_export_candidates(data_dir) -> List[SeedExportCandidate]:
             ),
             7 if len(headers) >= 8 else None,
         )
-        for row in rows[1:]:
+        for row_number, row in enumerate(rows[1:], 2):
             candidate_name = ""
             if (
                 counterparty_index is not None
@@ -436,13 +442,21 @@ def extract_seed_export_candidates(data_dir) -> List[SeedExportCandidate]:
                 and row[counterparty_index]
             ):
                 candidate_name = str(row[counterparty_index]).strip()
-            if not candidate_name or candidate_name in seen:
+            if not candidate_name:
                 continue
-            seen.add(candidate_name)
+            source = {"file": str(path.resolve()), "sheet": sheet_name,
+                      "cell": f"{openpyxl.utils.get_column_letter(counterparty_index + 1)}{row_number}", "value": candidate_name}
+            key = (candidate_name, relation_type)
+            if key in seen:
+                index = seen[key]
+                candidates[index] = replace(candidates[index], sources=candidates[index].sources + (source,))
+                continue
+            seen[key] = len(candidates)
             candidates.append(
                 SeedExportCandidate(
                     name=candidate_name,
                     relation_type=relation_type,
+                    sources=(source,),
                 )
             )
     return candidates
@@ -499,27 +513,50 @@ def _safe_output_path(folder: Path, filename: str) -> Path:
     return candidate
 
 
-def _ensure_export(state, state_path, exporter, company_names) -> Path:
-    if state.export_state_path:
-        export_state_path = Path(state.export_state_path)
+def _ensure_export(state, state_path, exporter, company_names, *, state_field="export_state_path") -> Path:
+    saved_path = getattr(state, state_field)
+    if saved_path:
+        export_state_path = Path(saved_path)
         export_state = load_export_state(export_state_path)
+        if set(export_state.company_names) != set(company_names):
+            raise ExportError("已保存导出任务的企业范围与本次不一致，未复用或覆盖旧证据")
         if export_state.status == "completed" and Path(export_state.extract_dir).is_dir():
-            return Path(export_state.extract_dir)
+            return _record_export_scope(export_state)
         if not export_state.required_dimensions:
             export_state_path = Path(state_path).with_name(
                 "{}-adaptive-export-state.json".format(state.task_id)
             )
-            state.export_state_path = str(export_state_path)
+            setattr(state, state_field, str(export_state_path))
             save_task_state(state_path, state)
             export_state = exporter.start_export(company_names, export_state_path)
     else:
         export_state_path = Path(state_path).with_name(
-            "{}-export-state.json".format(state.task_id)
+            "{}-{}-state.json".format(state.task_id, "candidate-export" if state_field == "candidate_export_state_path" else "export")
         )
-        state.export_state_path = str(export_state_path)
+        setattr(state, state_field, str(export_state_path))
         save_task_state(state_path, state)
         export_state = exporter.start_export(company_names, export_state_path)
-    return exporter.run_to_completion(export_state, export_state_path)
+    exporter.run_to_completion(export_state, export_state_path)
+    return _record_export_scope(load_export_state(export_state_path))
+
+
+def _record_export_scope(export_state):
+    """把范围和明确无数据说明随原始文件交付，离线重读仍能解释缺口。"""
+    folder = Path(export_state.extract_dir)
+    metadata = {
+        "company_names": export_state.company_names,
+        "created_at": export_state.created_at,
+        "required_dimensions": export_state.required_dimensions,
+        "dimension_results": export_state.dimension_results,
+        "batch_history": export_state.batch_history,
+    }
+    path = folder / "取数说明.json"
+    if path.exists():
+        if json.loads(path.read_text(encoding="utf-8-sig")) != metadata:
+            raise ExportError("取数说明与现有任务不一致，未覆盖原始资料")
+    else:
+        atomic_write_json(path, metadata)
+    return folder
 
 
 def _pause_export(state: TaskState, state_path: Path, error: ExportError) -> WorkflowResult:
@@ -530,34 +567,6 @@ def _pause_export(state: TaskState, state_path: Path, error: ExportError) -> Wor
     return WorkflowResult(state.status, state.message_zh)
 
 
-def _write_candidate_report(path: Path, discovery_result) -> None:
-    import openpyxl
-
-    workbook = openpyxl.Workbook()
-    sheet = workbook.active
-    sheet.title = "主动发现候选"
-    sheet.append([
-        "候选公司",
-        "层级",
-        "直接来源",
-        "关系类型",
-        "持股比例",
-        "发现理由",
-        "关系路径",
-        "说明",
-    ])
-    for candidate in discovery_result.candidates.values():
-        sheet.append([
-            candidate.name,
-            candidate.depth,
-            candidate.parent_name,
-            candidate.relation_type,
-            candidate.ratio if candidate.ratio is not None else "",
-            "；".join(candidate.reasons),
-            "；".join(candidate.paths),
-            "；".join(candidate.notes),
-        ])
-    workbook.save(path)
 
 
 def run_workflow(
@@ -578,6 +587,8 @@ def run_workflow(
     state.status = "running"
     save_task_state(state_file, state)
 
+    additional_data_dirs = []
+    object_records = []
     if state.mode == "existing_export":
         if not state.input_files:
             state.status = "waiting_user"
@@ -593,10 +604,10 @@ def run_workflow(
         candidate_count = 0
     elif state.mode in {"list_check", "discovery"}:
         client = client_factory()
-        raw_export_dir = _safe_output_path(
-            output_dir,
-            "{}_注协原始导出".format(company_stem),
-        )
+        raw_export_dir = Path(state.raw_export_dir) if state.raw_export_dir else _safe_output_path(
+            output_dir, "{}_注协原始导出".format(company_stem))
+        state.raw_export_dir = str(raw_export_dir)
+        save_task_state(state_file, state)
         if exporter_factory is None:
             exporter = CicpaExporter(client, artifact_dir=raw_export_dir)
         else:
@@ -642,6 +653,8 @@ def run_workflow(
                 dict.fromkeys(state.report_paths + [str(data_dir)])
             )
             candidate_count = len(names) - 1
+            object_records = [{"name": name, "relation_type": "用户提供名单", "reasons": ["用户提供名单"],
+                               "paths": [], "notes": [], "source_files": list(state.input_files)} for name in names if name != state.audited_entity]
         else:
             try:
                 data_dir = _ensure_export(
@@ -655,36 +668,42 @@ def run_workflow(
             state.report_paths = list(
                 dict.fromkeys(state.report_paths + [str(data_dir)])
             )
-            discovery_result = discoverer(
-                state.audited_entity,
-                client=client,
-                policy=DiscoveryPolicy(
-                    initial_depth=state.initial_depth,
-                    maximum_depth=state.maximum_depth,
-                    candidate_cap=state.candidate_cap,
-                ),
-                approved_depth=state.approved_depth,
-                seed_export_candidates=extract_seed_export_candidates(data_dir),
-            )
-            state.candidate_count = len(discovery_result.candidates)
-            if discovery_result.status != "completed":
+            if not state.discovery_completed:
+                discovery_result = discoverer(
+                    state.audited_entity, client=client,
+                    policy=DiscoveryPolicy(initial_depth=state.initial_depth,
+                        maximum_depth=state.maximum_depth, candidate_cap=state.candidate_cap),
+                    approved_depth=state.approved_depth,
+                    seed_export_candidates=extract_seed_export_candidates(data_dir),
+                )
+                state.candidate_count = len(discovery_result.candidates)
+                state.candidate_records = [asdict(candidate) for candidate in discovery_result.candidates.values()]
+                state.discovery_warnings = list(discovery_result.warnings)
+                state.discovery_completed = discovery_result.status == "completed"
                 state.status = discovery_result.status
                 state.message_zh = discovery_result.message_zh
                 save_task_state(state_file, state)
-                return WorkflowResult(
-                    state.status,
-                    state.message_zh,
-                    candidate_count=state.candidate_count,
-                )
-            candidate_path = _safe_output_path(
-                output_dir,
-                "{}_主动发现候选清单.xlsx".format(company_stem),
-            )
-            _write_candidate_report(candidate_path, discovery_result)
-            state.report_paths = list(
-                dict.fromkeys(state.report_paths + [str(candidate_path)])
-            )
+                if not state.discovery_completed:
+                    return WorkflowResult(state.status, state.message_zh, candidate_count=state.candidate_count)
+                snapshot = data_dir / "候选发现记录.json"
+                snapshot_data = {"candidates": state.candidate_records, "warnings": state.discovery_warnings}
+                if snapshot.exists():
+                    if json.loads(snapshot.read_text(encoding="utf-8-sig")) != snapshot_data:
+                        raise ExportError("候选发现记录与现有资料不一致，未覆盖原文件")
+                else:
+                    atomic_write_json(snapshot, snapshot_data)
+            object_records = state.candidate_records
             candidate_count = state.candidate_count
+            if object_records:
+                candidate_exporter = (CicpaExporter(client, artifact_dir=data_dir / "候选公司原始导出")
+                                      if exporter_factory is None else exporter_factory(client))
+                try:
+                    candidate_dir = _ensure_export(state, state_file, candidate_exporter,
+                        [record["name"] for record in object_records], state_field="candidate_export_state_path")
+                except ExportError as exc:
+                    return _pause_export(state, state_file, exc)
+                if candidate_dir != data_dir:
+                    additional_data_dirs.append(candidate_dir)
     else:
         raise ValueError("未知工作流模式：{}".format(state.mode))
 
@@ -699,6 +718,9 @@ def run_workflow(
         as_of_date=date.today(),
         disclosed_parties=set(state.disclosed_parties) if state.disclosed_parties else None,
         task_mode=state.mode,
+        additional_data_dirs=additional_data_dirs,
+        object_records=object_records,
+        discovery_warnings=state.discovery_warnings,
         scope_metadata={
             "初始穿透层数": state.initial_depth,
             "批准穿透层数": state.approved_depth,

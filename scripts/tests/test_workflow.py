@@ -589,11 +589,15 @@ class WorkflowModeTests(unittest.TestCase):
             },
         )
 
-    def test_主动发现模式只给被审计单位做完整维度导出(self):
+    def test_主动发现模式整批导出候选并合并报告(self):
         artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_discovery_mode_"))
         data_dir = artifact_dir / "甲公司_注协原始导出"
         data_dir.mkdir()
         exporter = FakeExporter(data_dir)
+        candidate_dir = data_dir / "候选公司原始导出"
+        candidate_dir.mkdir()
+        candidate_exporter = FakeExporter(candidate_dir)
+        exporters = iter([exporter, candidate_exporter])
         checker = FakeChecker()
         state_path = artifact_dir / "task.json"
         state = TaskState(
@@ -623,22 +627,23 @@ class WorkflowModeTests(unittest.TestCase):
             state,
             state_path,
             client_factory=lambda: object(),
-            exporter_factory=lambda _client: exporter,
+            exporter_factory=lambda _client: next(exporters),
             discoverer=lambda *_args, **_kwargs: discovery_result,
             checker=checker,
         )
 
         self.assertEqual(result.status, "completed")
         self.assertEqual(exporter.start_calls, [["甲公司"]])
+        self.assertEqual(candidate_exporter.start_calls, [["乙公司"]])
+        self.assertEqual(checker.calls[0]["additional_data_dirs"], [candidate_dir])
         self.assertEqual(result.candidate_count, 1)
-        self.assertTrue(
+        self.assertFalse(
             (artifact_dir / "甲公司_主动发现候选清单.xlsx").exists()
         )
         self.assertEqual(
             set(result.report_paths),
             {
                 data_dir,
-                artifact_dir / "甲公司_主动发现候选清单.xlsx",
                 artifact_dir / "甲公司_关联方核查报告.xlsx",
             },
         )

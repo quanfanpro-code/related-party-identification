@@ -237,13 +237,13 @@ class RunCheckIntegrationTests(unittest.TestCase):
 
         workbook = openpyxl.load_workbook(output_path)
         try:
-            sheet = workbook["汇总判断"]
-            self.assertEqual(sheet["A3"].value, "公司A")
-            self.assertEqual(sheet["A3"].fill.fgColor.rgb, "00305496")
+            sheet = workbook["关系核查汇总"]
+            self.assertEqual(sheet["B3"].value, "公司A")
+            self.assertEqual(sheet["B3"].fill.fgColor.rgb, "001F4E79")
             self.assertEqual(sheet["A3"].font.color.rgb, "00FFFFFF")
-            self.assertEqual(sheet["A4"].value, "乙公司")
-            self.assertNotEqual(sheet["A4"].fill.fgColor.rgb, "00305496")
-            self.assertEqual(sheet.freeze_panes, "A4")
+            self.assertEqual(sheet["B4"].value, "乙公司")
+            self.assertEqual(sheet["E4"].fill.fgColor.rgb, "00FCE4D6")
+            self.assertEqual(sheet.freeze_panes, "C4")
         finally:
             workbook.close()
 
@@ -271,8 +271,10 @@ class RunCheckIntegrationTests(unittest.TestCase):
         )
         workbook = openpyxl.load_workbook(output_path, read_only=True)
         try:
-            self.assertIn("数据质量与限制", workbook.sheetnames)
-            self.assertIn("任务范围", workbook.sheetnames)
+            self.assertIn("数据覆盖与缺口", workbook.sheetnames)
+            self.assertIn("任务说明", workbook.sheetnames)
+            self.assertTrue(any("主要人员（高管）.xlsx" in str(row) and "读取失败" in str(row)
+                                for row in workbook["数据覆盖与缺口"].values))
         finally:
             workbook.close()
 

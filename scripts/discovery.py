@@ -38,6 +38,7 @@ class SeedExportCandidate:
     name: str
     relation_type: str
     red_flags: tuple = ()
+    sources: tuple = ()
 
 
 @dataclass
@@ -51,6 +52,7 @@ class Candidate:
     reasons: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     paths: List[str] = field(default_factory=list)
+    sources: List[dict] = field(default_factory=list)
 
     def merge_evidence(self, reasons: List[str], notes: List[str], path: str) -> None:
         for value in reasons:
@@ -84,13 +86,14 @@ def _relation_label(edge: EquityEdge) -> str:
 
 
 def _person_names(client, company_id: str, warnings: List[str]) -> set:
+    from scripts.related_party_check import normalize_name, is_organization
     if not company_id:
         return set()
     try:
         return {
-            person.name.strip()
+            normalize_name(person.name)
             for person in client.get_key_personnel(company_id)
-            if person.name and person.name.strip()
+            if normalize_name(person.name) and not is_organization(normalize_name(person.name))
         }
     except Exception:
         warnings.append("主要人员数据未完整取得：{}".format(company_id))
@@ -117,8 +120,6 @@ def discover(
     exact = [match for match in matches if match.name == name]
     if len(exact) == 1:
         seed = exact[0]
-    elif len(matches) == 1:
-        seed = matches[0]
     else:
         return DiscoveryResult(
             status="needs_company_confirmation",
@@ -139,6 +140,7 @@ def discover(
         existing = result.candidates.get(candidate.name)
         if existing is not None:
             existing.merge_evidence(reasons, notes, path)
+            existing.sources.extend(source for source in candidate.sources if source not in existing.sources)
             existing.depth = min(existing.depth, candidate.depth)
             return existing
         if len(result.candidates) >= policy.candidate_cap:
@@ -164,6 +166,7 @@ def discover(
                 depth=1,
                 parent_name=seed.name,
                 relation_type=item.relation_type,
+                sources=list(getattr(item, "sources", ())),
             ),
             reasons,
             [],
@@ -200,8 +203,12 @@ def discover(
             )
             reasons = ["{}持股比例 {}%".format(label, edge.ratio)]
             notes = []
-            meets_threshold = edge.ratio >= policy.equity_threshold
-            if not meets_threshold:
+            meets_threshold = edge.ratio is not None and edge.ratio >= policy.equity_threshold
+            if edge.ratio is None:
+                reasons = [label + "已取得，持股比例未取得"]
+                notes.append("比例缺失，保留候选待核实，本轮不据此继续扩层")
+                path = "{} --{} 比例未取得--> {}".format(" → ".join(parent_path), label, candidate_name)
+            elif not meets_threshold:
                 candidate_people = _person_names(
                     client,
                     edge.company_id,
@@ -223,6 +230,8 @@ def discover(
                     parent_name=parent.name,
                     relation_type=label,
                     ratio=edge.ratio,
+                    sources=[{"type": "股权查询", "company": parent.name, "company_id": parent.org_id,
+                              "counterparty": candidate_name, "relation_type": label, "ratio": edge.ratio}],
                 ),
                 reasons,
                 notes,
@@ -234,6 +243,9 @@ def discover(
             key = _company_key(edge.company_id, candidate_name)
             if meets_threshold and key not in visited:
                 visited.add(key)
+                if not edge.company_id:
+                    result.warnings.append("候选企业标识缺失，未能继续穿透：" + candidate_name)
+                    continue
                 queue.append(
                     (
                         CompanyMatch(org_id=edge.company_id, name=candidate_name),
