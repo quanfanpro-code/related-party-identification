@@ -52,6 +52,7 @@ from scripts.discovery import (
     discover,
 )
 from scripts.state_io import atomic_write_json
+from scripts.逐家取数 import SingleCompanyError, collect_by_company
 
 
 DEPENDENCIES = ("requests", "openpyxl")
@@ -83,6 +84,8 @@ class TaskState:
     discovery_completed: bool = False
     discovery_warnings: List[str] = field(default_factory=list)
     raw_export_dir: str = ""
+    degraded_export: bool = False
+    degraded_reason: str = ""
 
 
 @dataclass
@@ -567,6 +570,39 @@ def _pause_export(state: TaskState, state_path: Path, error: ExportError) -> Wor
     return WorkflowResult(state.status, state.message_zh)
 
 
+def _fallback_to_single_company(
+    state: TaskState,
+    state_path: Path,
+    client,
+    data_dir,
+    company_names: List[str],
+    reason: str,
+) -> Path:
+    """批量导出通道不可用时的保底做法：改成逐个企业取数。
+
+    逐家取数只能覆盖基础工商信息、最新公示股东、实际控制人、最终受益人和对外投资，
+    其余维度（客户、供应商、发票、变更记录、主要人员等）本次取不到，报告会如实标注为缺口。
+    """
+    state.degraded_export = True
+    state.degraded_reason = str(reason)
+    warning = (
+        "批量导出通道不可用（{}），已改用逐家取数：本次只覆盖基础工商信息、最新公示股东、"
+        "实际控制人、最终受益人、对外投资；客户、供应商、发票信息、变更记录、主要人员等"
+        "维度本次无法取得，报告中如实标注为数据缺口。".format(reason)
+    )
+    if warning not in state.discovery_warnings:
+        state.discovery_warnings.append(warning)
+    save_task_state(state_path, state)
+    try:
+        collect_by_company(client, company_names, Path(data_dir), fallback_reason=str(reason))
+    except SingleCompanyError as exc:
+        save_task_state(state_path, state)
+        raise ExportError(
+            "{}；逐家取数保底也未取得资料：{}".format(reason, exc)
+        ) from exc
+    return Path(data_dir)
+
+
 
 
 def run_workflow(
@@ -648,7 +684,12 @@ def run_workflow(
             try:
                 data_dir = _ensure_export(state, state_file, exporter, names)
             except ExportError as exc:
-                return _pause_export(state, state_file, exc)
+                try:
+                    data_dir = _fallback_to_single_company(
+                        state, state_file, client, raw_export_dir, names, str(exc)
+                    )
+                except ExportError as fallback_error:
+                    return _pause_export(state, state_file, fallback_error)
             state.report_paths = list(
                 dict.fromkeys(state.report_paths + [str(data_dir)])
             )
@@ -664,17 +705,30 @@ def run_workflow(
                     [state.audited_entity],
                 )
             except ExportError as exc:
-                return _pause_export(state, state_file, exc)
+                try:
+                    data_dir = _fallback_to_single_company(
+                        state,
+                        state_file,
+                        client,
+                        raw_export_dir,
+                        [state.audited_entity],
+                        str(exc),
+                    )
+                except ExportError as fallback_error:
+                    return _pause_export(state, state_file, fallback_error)
             state.report_paths = list(
                 dict.fromkeys(state.report_paths + [str(data_dir)])
             )
             if not state.discovery_completed:
+                seed_candidates = (
+                    [] if state.degraded_export else extract_seed_export_candidates(data_dir)
+                )
                 discovery_result = discoverer(
                     state.audited_entity, client=client,
                     policy=DiscoveryPolicy(initial_depth=state.initial_depth,
                         maximum_depth=state.maximum_depth, candidate_cap=state.candidate_cap),
                     approved_depth=state.approved_depth,
-                    seed_export_candidates=extract_seed_export_candidates(data_dir),
+                    seed_export_candidates=seed_candidates,
                 )
                 state.candidate_count = len(discovery_result.candidates)
                 state.candidate_records = [asdict(candidate) for candidate in discovery_result.candidates.values()]
@@ -694,7 +748,21 @@ def run_workflow(
                     atomic_write_json(snapshot, snapshot_data)
             object_records = state.candidate_records
             candidate_count = state.candidate_count
-            if object_records:
+            if object_records and state.degraded_export:
+                # 保底路线：候选企业也用逐家取数补齐，维度文件按全部企业重写一次
+                try:
+                    collect_by_company(
+                        client,
+                        [state.audited_entity] + [record["name"] for record in object_records],
+                        data_dir,
+                        fallback_reason=state.degraded_reason,
+                    )
+                except SingleCompanyError as exc:
+                    state.discovery_warnings.append(
+                        "逐家取数补充候选企业时未完整取得：{}".format(exc)
+                    )
+                    save_task_state(state_file, state)
+            elif object_records:
                 candidate_exporter = (CicpaExporter(client, artifact_dir=data_dir / "候选公司原始导出")
                                       if exporter_factory is None else exporter_factory(client))
                 try:
