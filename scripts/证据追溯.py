@@ -34,6 +34,8 @@ SOURCE_COLUMNS = {
     "names": [("basic", (1, 21), ())],
     "past_legal": [("legal_change", (2, 3), ())],
     "past_address": [("change", (5,), (3, 4, 6))],
+    "past_investor": [("change", (5,), (3, 4, 6))],
+    "dual_role": [("customer", (8,), ()), ("supplier", (8,), ())],
     "pledge": [("pledge", (4, 6), ())],
     "mortgage": [("mortgage", (5, 6), ())],
     "trademark": [("trademark", (3,), ())],
@@ -53,7 +55,7 @@ def trace(company, group, values=None, *, normalize=str, row_match=None):
                 continue
             if row_match is not None and not row_match(row):
                 continue
-            if dimension == "change" and "地址" not in str(row[3] if len(row) > 3 else ""):
+            if group == "past_address" and dimension == "change" and "地址" not in str(row[3] if len(row) > 3 else ""):
                 continue
             matched = []
             for column in columns:

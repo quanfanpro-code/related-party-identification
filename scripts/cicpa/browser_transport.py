@@ -190,7 +190,7 @@ class OpenCliTransport:
     def wait_for_login(
         self,
         timeout: float = 900.0,
-        poll: float = 2.5,
+        poll: float = 5.0,
         clock: Optional[Callable[[], float]] = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -216,6 +216,7 @@ class OpenCliTransport:
         files: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         timeout: float = 30.0,
+        _nav_retries: int = 0,
         **_: Any,
     ) -> _Response:
         if not url.startswith(ZSK_BASE + "/") and url != ZSK_BASE:
@@ -284,6 +285,8 @@ class OpenCliTransport:
         except jsonlib.JSONDecodeError as exc:
             raise OpenCliBridgeError("页面取数返回内容无法解析") from exc
         if payload.get("nav"):
+            if _nav_retries >= 2:
+                raise OpenCliBridgeError("页面连续偏离注协域名，重新打开 2 次后仍未恢复")
             self.open_page(ZSK_BASE + "/#/home_local")
             return self.request(
                 method,
@@ -293,6 +296,7 @@ class OpenCliTransport:
                 files=files,
                 headers=headers,
                 timeout=timeout,
+                _nav_retries=_nav_retries + 1,
             )
         content = base64.b64decode(payload.get("b") or "")
         return _Response(int(payload.get("s", 0)), dict(payload.get("h") or {}), content)

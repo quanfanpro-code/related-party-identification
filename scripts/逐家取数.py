@@ -97,14 +97,6 @@ def _clean_ratio(value: Any) -> str:
     return raw + "%"
 
 
-def _ratio_number(value: Any) -> Optional[float]:
-    raw = str(value or "").replace("%", "").replace(",", "").strip()
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
-
-
 def _equity_children(container: Any) -> List[Dict[str, Any]]:
     if isinstance(container, list):
         return [item for item in container if isinstance(item, dict)]
@@ -126,13 +118,15 @@ def _business_data(payload: Any, alias: str) -> Any:
     return payload.get("data", {})
 
 
-def resolve_company_id(client, name: str) -> str:
-    """按工商全称匹配企业标识，匹配不到就明确报错。"""
+def resolve_company_id(client, name: str, warnings: Optional[List[str]] = None) -> str:
+    """按工商全称匹配企业标识，匹配不到就明确报错；单条模糊匹配照常采用但留痕。"""
     matches = client.search_companies(name)
     exact = [match for match in matches if match.name == name]
     if len(exact) == 1:
         return exact[0].org_id
     if len(matches) == 1:
+        if warnings is not None:
+            warnings.append("模糊匹配：查询 {} 采用 {}，主体待核实".format(name, matches[0].name))
         return matches[0].org_id
     raise SingleCompanyError("企业名称无法唯一匹配，需要确认具体主体：" + str(name))
 
@@ -142,7 +136,7 @@ def fetch_company(client, name: str) -> CompanyProfile:
     profile = CompanyProfile(name=str(name).strip())
     if not profile.name:
         raise SingleCompanyError("企业名称不能为空")
-    profile.company_id = resolve_company_id(client, profile.name)
+    profile.company_id = resolve_company_id(client, profile.name, warnings=profile.warnings)
 
     detail = _business_data(
         client.request_json(
@@ -232,11 +226,14 @@ def fetch_company(client, name: str) -> CompanyProfile:
         if person:
             profile.controllers.append(person)
 
-    # 最终受益人
+    # 最终受益人（比例与股东同口径，避免报告里受益比例恒为空）
     for item in equity.get("final_beneficiaries") or []:
         person = _text(item, "name")
         if person:
-            profile.beneficiaries.append((person, ""))
+            profile.beneficiaries.append((
+                person,
+                _clean_ratio(_text(item, "czbl", "benefitRatio", "investRatio", "held_ratio", "ratio")),
+            ))
 
     # 对外投资
     for item in _equity_children(equity.get("invests")):
@@ -277,8 +274,11 @@ def _write_sheet(path: Path, headers, rows) -> None:
     workbook.close()
 
 
-def write_dimension_files(profiles: List[CompanyProfile], data_dir: Path) -> Dict[str, str]:
-    """把逐家取到的数据写成与批量导出同名的维度文件，返回各维度的完成状态。"""
+def write_dimension_files(profiles: List[CompanyProfile], data_dir: Path, warnings: Optional[List[str]] = None) -> Dict[str, str]:
+    """把逐家取到的数据写成与批量导出同名的维度文件，返回各维度的完成状态。
+
+    每个维度统计实际覆盖的公司集合；少于成功取数公司时，把未覆盖名单写进 warnings 留痕。
+    """
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     dimension_results: Dict[str, str] = {}
@@ -314,6 +314,21 @@ def write_dimension_files(profiles: List[CompanyProfile], data_dir: Path) -> Dic
     ]
     _write_sheet(data_dir / "对外投资（新）.xlsx", INVEST_HEADERS, invest_rows)
     dimension_results["S0000104"] = "completed" if invest_rows else "no_data"
+
+    if warnings is not None:
+        succeeded = {profile.name for profile in profiles}
+        coverage = (
+            ("基础工商信息", {profile.name for profile in profiles if profile.basic}),
+            ("最新公示股东", {profile.name for profile in profiles if profile.holders}),
+            ("实际控制人", {profile.name for profile in profiles if profile.controllers}),
+            ("最终受益人", {profile.name for profile in profiles if profile.beneficiaries}),
+            ("对外投资（新）", {profile.name for profile in profiles if profile.investments}),
+        )
+        for label, covered in coverage:
+            uncovered = succeeded - covered
+            if uncovered:
+                warnings.append("维度{}未覆盖公司：{}（这些公司该维度未取得，报告中如实标注为缺口）".format(
+                    label, "、".join(sorted(uncovered))))
     return dimension_results
 
 
@@ -366,7 +381,7 @@ def collect_by_company(
     if not profiles:
         raise SingleCompanyError("全部企业逐家取数均失败，未取得任何可用资料")
 
-    dimension_results = write_dimension_files(profiles, data_dir)
+    dimension_results = write_dimension_files(profiles, data_dir, warnings=warnings)
     for profile in profiles:
         warnings.extend(profile.warnings)
     write_scope_note(

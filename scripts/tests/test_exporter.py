@@ -346,8 +346,8 @@ class ExportFlowTests(unittest.TestCase):
         self.assertEqual(state.active_group, [codes[0]])
         self.assertEqual(state.pending_groups, [[codes[1]]])
 
-    def test_单维度第二个轮询窗口失败后暂停(self):
-        artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_export_single_pause_"))
+    def test_单维度第二个轮询窗口失败后记未取得并继续(self):
+        artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_export_single_missing_"))
         state_path = artifact_dir / "state.json"
         state = waiting_state(artifact_dir)
         state.required_dimensions = ["S0000002"]
@@ -358,9 +358,11 @@ class ExportFlowTests(unittest.TestCase):
         exporter.handle_poll_window_failure(state, state_path)
         exporter.handle_poll_window_failure(state, state_path)
 
-        self.assertEqual(state.status, "paused")
-        self.assertEqual(state.active_group, ["S0000002"])
+        self.assertNotEqual(state.status, "paused")
+        self.assertEqual(state.dimension_results["S0000002"], "missing")
+        self.assertEqual(state.active_group, [])
         self.assertIn("基础工商信息", state.message_zh)
+        self.assertIn("未取得", state.message_zh)
 
     def test_未完成轮询交给客户端按_poll_节奏等待(self):
         artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_export_poll_wait_"))
@@ -846,7 +848,7 @@ class ExportValidationTests(unittest.TestCase):
         self.assertTrue((artifact_dir / "股东信息.xlsx").exists())
         self.assertTrue((artifact_dir / "dimension-batches" / "batch-001.zip").exists())
 
-    def test_同名不同哈希文件暂停且不覆盖旧证据(self):
+    def test_同名不同哈希文件改名保留且不覆盖旧证据(self):
         artifact_dir = Path(tempfile.mkdtemp(prefix="rpi_export_conflict_"))
         state_path = artifact_dir / "state.json"
         code = "S0000002"
@@ -868,11 +870,13 @@ class ExportValidationTests(unittest.TestCase):
             artifact_dir=artifact_dir,
         )
 
-        with self.assertRaises(ExportValidationError):
-            exporter.download_current_group(state, task, state_path)
+        completed = exporter.download_current_group(state, task, state_path)
 
+        self.assertEqual(completed, [code])
         self.assertEqual(existing.read_bytes(), b"old evidence")
-        self.assertEqual(state.status, "paused")
+        self.assertNotEqual(state.status, "paused")
+        self.assertEqual(state.dimension_results[code], "completed")
+        self.assertTrue((artifact_dir / "基础工商信息.本批.xlsx").exists())
         self.assertTrue(
             (artifact_dir / "dimension-batches" / "batch-001_files" / existing.name).exists()
         )

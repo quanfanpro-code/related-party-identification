@@ -180,6 +180,8 @@ class CicpaClient:
     def _retry_after_seconds(response) -> Optional[float]:
         value = response.headers.get("Retry-After")
         if value is None:
+            value = response.headers.get("retry-after")
+        if value is None:
             return None
         try:
             seconds = float(value)
@@ -263,7 +265,10 @@ class CicpaClient:
         except (TypeError, ValueError) as exc:
             raise CicpaError("接口返回的不是有效 JSON") from exc
 
-        if cache_key is not None:
+        # 只有业务成功的响应才进缓存；业务错误载荷缓存后会挡住后续重试
+        if cache_key is not None and (
+            not isinstance(payload, dict) or payload.get("status_code") in (None, 0)
+        ):
             self._cache[cache_key] = payload
         return payload
 

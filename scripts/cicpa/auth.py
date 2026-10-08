@@ -22,6 +22,7 @@ from typing import Callable, Optional
 
 from .browser_transport import OpenCliBridgeError, OpenCliTransport
 from .opencli_setup import opencli_extension_installed  # noqa: F401 供工作流复用
+from scripts.state_io import atomic_write_json
 
 
 VALID_STATUSES = {"idle", "waiting_user", "authenticated", "expired", "failed"}
@@ -100,14 +101,7 @@ def write_login_status(path: Path, status: str, message_zh: str) -> dict:
     destination = Path(path)
     payload = public_login_status(status, message_zh)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    text = json.dumps(payload, ensure_ascii=False, indent=2)
-    with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
-        stream.write(text)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, destination)
+    atomic_write_json(destination, payload)
     return payload
 
 

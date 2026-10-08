@@ -285,12 +285,21 @@ def _classify_sensitive_changes(
         text = candidate.read_text(encoding="utf-8-sig").lower() if candidate.exists() else ""
         if re.search(r"login|cookie|auth|password|验证码|登录|会话", text):
             categories.add("auth")
-        if re.search(r"/api/|https?://|endpoint|requests?\\.", text):
+        if re.search(r"/api/|https?://|endpoint|requests?\.", text):
             categories.add("api")
-        if re.search(r"export|dimension|download|\\.xlsx|维度|导出|文件名", text):
+        if re.search(r"export|dimension|download|\.xlsx|维度|导出|文件名", text):
             categories.add("export")
     # ponytail: 无旧源码正文时采用保守关键词分类；未来若保存规范化基线，可升级为逐段语义差异。
     return categories
+
+
+# 秘密扫描：正则用单反斜杠（双重转义会让 \s 失效）；.py 也在扫描范围内。
+SECRET_PATTERNS = (
+    re.compile(r"authorization\s*[:=]\s*bearer\s+[a-z0-9._-]{20,}", re.I),
+    re.compile(r"(?:sessionid|cicpa_token)[\"']?\s*[:=]\s*[\"']?[a-z0-9._-]{20,}", re.I),
+    re.compile(r"[\"']password[\"']\s*:\s*[\"'][^\"']+[\"']", re.I),
+)
+SECRET_SCAN_SUFFIXES = {".json", ".yaml", ".yml", ".txt", ".log", ".md", ".py"}
 
 
 def _default_checks(skill_root: Path) -> dict[str, bool]:
@@ -338,20 +347,14 @@ def _default_checks(skill_root: Path) -> dict[str, bool]:
             encoding_ok = False
             break
 
-    secret_patterns = (
-        re.compile(r"authorization\\s*[:=]\\s*bearer\\s+[a-z0-9._-]{20,}", re.I),
-        re.compile(r"(?:sessionid|cicpa_token)\\s*[:=]\\s*[\"']?[a-z0-9._-]{20,}", re.I),
-        re.compile(r"[\"']password[\"']\\s*:\\s*[\"'][^\"']+[\"']", re.I),
-    )
     secret_leaks_ok = True
-    scan_suffixes = {".json", ".yaml", ".yml", ".txt", ".log", ".md"}
     for path in skill_root.rglob("*"):
         if not path.is_file() or "__pycache__" in path.parts:
             continue
-        if path.suffix.lower() not in scan_suffixes and path.name != "NOTICE":
+        if path.suffix.lower() not in SECRET_SCAN_SUFFIXES and path.name != "NOTICE":
             continue
         text = path.read_text(encoding="utf-8-sig")
-        if any(pattern.search(text) for pattern in secret_patterns):
+        if any(pattern.search(text) for pattern in SECRET_PATTERNS):
             secret_leaks_ok = False
             break
     return {

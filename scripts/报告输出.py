@@ -15,7 +15,7 @@ from openpyxl.workbook.defined_name import DefinedName
 
 SHEETS = {
     "目录": "先看概览，再按公司关系查看证据；所有原始资料保持原样。",
-    "核查概览": "范围、进度、命中和数据缺口分别统计。",
+    "核查概览": "先看结论与重点线索，再查范围、口径和数据缺口。",
     "核查对象与来源": "每家公司为何纳入、取得什么资料、实际查到哪一步。",
     "关系核查汇总": "每对有命中的公司一行；自动初判与人工复核意见分开。",
     "证据明细": "每条证据的判断依据及实际参与匹配的原始字段，可按证据编号筛选。",
@@ -26,6 +26,8 @@ NAVY = "1F4E79"
 PALE = "D6E4F0"
 LIGHT = "F3F7FB"
 RISK_COLORS = {"高": "FCE4D6", "中": "FFF2CC", "低": "E2F0D9"}
+# 概览与汇总的"主要线索摘要"长度上限：按整条证据取舍，不切断单条证据。
+SUMMARY_LIMIT = 240
 DIMENSIONS = {
     "basic": ("基础工商信息", "工商指纹、人员、客商画像、历史痕迹"),
     "shareholder": ("股东信息", "人员、共同股东"),
@@ -173,9 +175,44 @@ def finish_sheet(ws, risk_column=None):
     ws.print_area = f"A1:{get_column_letter(ws.max_column)}{max(4, ws.max_row)}"
 
 
+def group_evidence_blocks(ws, risk_column=5):
+    """同一证据编号的连续多行视为一块：相邻块交替浅底色、块首行加粗上边框，肉眼可分辨块界。"""
+    if ws.max_row < 4:
+        return
+    previous = None
+    block = -1
+    for row in ws.iter_rows(min_row=4, max_row=ws.max_row):
+        if row[0].value != previous:
+            previous = row[0].value
+            block += 1
+            for cell in row:
+                cell.border = Border(top=Side(style="medium", color=NAVY), bottom=Side(style="hair", color="D9E2F3"))
+        fill = PALE if block % 2 else "FFFFFF"
+        for cell in row:
+            if cell.column != risk_column:  # 风险列保留红黄绿底色双通道
+                cell.fill = PatternFill("solid", fgColor=fill)
+
+
+def clue_summary(item, limit=SUMMARY_LIMIT):
+    """概览与汇总共用的一份摘要：按整条证据取舍，宁少列一条也不切断一条。"""
+    items = list(item.get("evidence_items") or []) or [item.get("evidence", "")]
+    kept, total = [], 0
+    for text in items:
+        if kept and total + len(text) + 3 > limit:
+            break
+        kept.append(text)
+        total += len(text) + 3
+    omitted = len(items) - len(kept)
+    joined = " | ".join(kept)
+    if omitted:
+        joined += f"…（另 {omitted} 条见明细）"
+    return ("多条独立线索相互印证；" if item.get("corroborated") else "") + joined
+
+
 def coverage_rows(names, companies, file_info, errors):
     rows = []
     incomplete = set()
+    gap_dimensions = Counter()
     for name in names:
         for key, (label, impact) in DIMENSIONS.items():
             infos = [item for item in file_info if item["key"] == key]
@@ -207,13 +244,16 @@ def coverage_rows(names, companies, file_info, errors):
                     detail = "缺失或不能按本次口径解析的字段：" + "、".join(blanks)
             if status not in {"已取得记录", "明确无数据", "已核对范围，未见记录"} and key not in {"customer", "supplier", "abnormal"}:
                 incomplete.add(name)
+                gap_dimensions[name] += 1
             chosen = record or next(iter(own or infos), {})
             rows.append([name, label, status, impact, detail, chosen.get("file", ""), chosen.get("created_at", "未记录") or "未记录"])
         if name not in companies:
             incomplete.add(name)
         if any(name in str(item.get("message", "")) or name == item.get("source") for item in errors):
             incomplete.add(name)
-    return rows, incomplete
+    # 重度缺口：未取得基础工商记录，或缺失维度达 10 个及以上；其余缺口公司为轻度。
+    severe = {name for name in names if name not in companies or gap_dimensions.get(name, 0) >= 10}
+    return rows, incomplete, severe
 
 
 def write_report(out_path, summary, all_hits, companies, dim, target_display, data_completeness,
@@ -234,7 +274,7 @@ def write_report(out_path, summary, all_hits, companies, dim, target_display, da
             objects[name]["sources"] = objects[name].get("sources", []) + record.get("sources", [])
     names = sorted(set(companies) | target_set | set(objects) | {name for info in file_info for name in info["scope"]}
                    | {name for info in file_info if info["key"] == "basic" for name in info["companies"]})
-    coverage, incomplete = coverage_rows(names, companies, file_info, errors)
+    coverage, incomplete, severe = coverage_rows(names, companies, file_info, errors)
     counts = Counter(risk_text(item["max_level"]) for item in summary)
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -242,32 +282,50 @@ def write_report(out_path, summary, all_hits, companies, dim, target_display, da
     for title, description in list(SHEETS.items())[1:]:
         row = append_row(ws, [title, description, None])
         link(ws.cell(row, 1), title, 1)
-    overview = create_sheet(wb, "核查概览", ["项目", "数量或情况", "统计口径 / 下一步"], [32, 48, 86])
-    metrics = [
-        ["被审计单位", target_display, "自动初判须结合审计程序核实"],
-        ["纳入范围公司数", len(names), "包括被审计单位、候选及资料未取得的核查对象，按名称去重"],
-        ["主动发现候选公司数", len(set(objects) - target_set) if task_mode == "discovery" else 0, "只有主动发现模式计入；候选不等于关联方"],
-        ["取得基础资料公司数", len(companies), "基础工商表可读取并已构建为核查对象"],
-        ["实际尝试比对公司对数", scope.get("实际尝试比对公司对数", len(companies) * (len(companies) - 1) // 2), "两家公司组成一对，任一规则失败另列数据缺口"],
-        ["命中公司对数", len(summary), "同一公司对命中多条证据，只计一对"],
-        ["证据条数", len({hit.get("evidence_id", str(i)) for i, hit in enumerate(all_hits)}), "按证据编号去重；明细的多个来源行不重复计数"],
-        ["高风险公司对数", counts["高"], "按该公司对最高风险等级统计，待核实"],
-        ["中风险公司对数", counts["中"], "与高、低风险公司对互不重复"],
-        ["低风险公司对数", counts["低"], "低风险线索仍是命中，不表示没有问题"],
-        ["存在数据缺口公司数", len(incomplete), "缺资料、空字段或规则失败；具体影响见数据覆盖与缺口"],
-        ["读取、字段或规则错误条数", len(errors), "错误不能当作未命中"],
-        ["发现过程提示条数", sum(item.get("category") == "候选发现不完整" for item in limitations), "发现过程中取数失败会影响候选范围完整性"],
-    ]
-    for record in metrics:
+    overview = create_sheet(wb, "核查概览", ["项目", "数量或情况", "与审计对象的关系", "统计口径 / 下一步"], [32, 48, 33, 76])
+    # 结论先行：先给读懂报告所需的前提、降级提示和分级结果，再列重点线索，范围与口径注解殿后。
+    append_row(overview, ["自动结论含义",
+        scope.get("自动结论含义", "仅为线索初判；未命中不代表不存在关联关系；其他核查对象之间的命中不推定与被审计单位关联"),
+        "", "理解本报告全部数字与线索的前提"])
+    for item in limitations:
+        if item.get("category") == "取数通道降级":
+            append_row(overview, ["取数通道降级提示", item.get("message", ""), "",
+                f"来源：{item.get('source', '')}；受影响范围详见数据覆盖与缺口"])
+    for record in [
+        ["高风险公司对数", counts["高"], "", "按该公司对最高风险等级统计，待核实"],
+        ["中风险公司对数", counts["中"], "", "与高、低风险公司对互不重复"],
+        ["低风险公司对数", counts["低"], "", "低风险线索仍是命中，不表示没有问题"],
+    ]:
         append_row(overview, record)
-    append_row(overview, ["重点线索", "点击公司对进入汇总", "下列按风险排序；完整原文见证据明细"])
+    if not counts["高"] and not counts["中"]:
+        append_row(overview, ["重要提示", "本结果不提供关联方完整性保证", "",
+            "零命中或全部为低风险线索；未命中不代表不存在关联关系，关联方完整性须结合其他审计程序确认"])
+    append_row(overview, ["重点线索", "点击公司对进入汇总", "与审计对象的关系", "下列按风险排序；完整原文见证据明细"])
     overview_links = []
     for item in summary:
         row = append_row(overview, [f"{item['company_a']} ↔ {item['company_b']}", risk_text(item["max_level"]) + "风险线索",
-                                   item["evidence"][:180] + ("…（完整见明细）" if len(item["evidence"]) > 180 else "")])
+                                   item["relation_type"],
+                                   clue_summary(item)])
         overview_links.append((row, pair_key(item["company_a"], item["company_b"])))
     if not summary:
-        append_row(overview, ["本次未形成命中", "请结合数据缺口阅读", "只说明实际取得资料中的规则结果"])
+        append_row(overview, ["本次未形成命中", "请结合数据缺口阅读", "", "只说明实际取得资料中的规则结果"])
+    append_row(overview, ["范围与口径指标", "以下为范围、进度与统计口径注解", "", ""])
+    metrics = [
+        ["被审计单位", target_display, "", "自动初判须结合审计程序核实"],
+        ["纳入范围公司数", len(names), "", "包括被审计单位、候选及资料未取得的核查对象，按名称去重"],
+        ["主动发现候选公司数", len(set(objects) - target_set) if task_mode == "discovery" else 0, "", "只有主动发现模式计入；候选不等于关联方"],
+        ["取得基础资料公司数", len(companies), "", "基础工商表可读取并已构建为核查对象"],
+        ["实际尝试比对公司对数", scope.get("实际尝试比对公司对数", len(companies) * (len(companies) - 1) // 2), "", "两家公司组成一对，任一规则失败另列数据缺口"],
+        ["命中公司对数", len(summary), "", "同一公司对命中多条证据，只计一对"],
+        ["证据条数", len({hit.get("evidence_id", str(i)) for i, hit in enumerate(all_hits)}), "", "按证据编号去重；明细的多个来源行不重复计数"],
+        ["存在数据缺口公司数", len(incomplete), "", "缺资料、空字段或规则失败；具体影响见数据覆盖与缺口"],
+        ["其中重度缺口公司数", len(severe), "", "未取得基础工商记录，或缺失维度达 10 个及以上；缺口实质削弱核查结论"],
+        ["其中轻度缺口公司数", len(incomplete - severe), "", "其余存在缺口的公司；个别维度或字段缺失，影响相对有限"],
+        ["读取、字段或规则错误条数", len(errors), "", "错误不能当作未命中"],
+        ["发现过程提示条数", sum(item.get("category") == "候选发现不完整" for item in limitations), "", "发现过程中取数失败会影响候选范围完整性"],
+    ]
+    for record in metrics:
+        append_row(overview, record)
 
     roster = create_sheet(wb, "核查对象与来源",
         ["公司名称", "对象来源", "发现理由 / 名单来源", "层级", "直接来源", "关系路径", "资料情况", "比对结果", "法定代表人", "成立日期", "注册资本（人民币元）", "参保人数", "来源记录 / 说明"],
@@ -296,32 +354,38 @@ def write_report(out_path, summary, all_hits, companies, dim, target_display, da
             company.insured if company else None, "\n".join(source_notes + record.get("notes", []))])
 
     summary_ws = create_sheet(wb, "关系核查汇总",
-        ["公司对编号", "公司A", "公司B", "与审计对象的关系", "风险初判", "主要线索摘要", "命中类别", "证据条数", "查看全部证据", "建议审计程序", "资料限制", "人工复核意见", "复核人 / 日期"],
-        [20, 28, 28, 33, 12, 48, 30, 12, 22, 45, 30, 40, 24])
+        ["公司对编号", "公司A", "公司B", "与审计对象的关系", "风险初判", "主要线索摘要", "命中类别", "证据条数", "查看全部证据", "建议审计程序", "资料限制", "人工复核意见", "复核人 / 日期", "序号"],
+        [20, 28, 28, 33, 12, 48, 30, 12, 22, 45, 30, 40, 24, 10])
     summary_rows = {}
-    for item in summary:
+    for index, item in enumerate(summary, 1):
         key = pair_key(item["company_a"], item["company_b"])
+        # GX- 编号保留作链接锚点；末尾"对-XX"序号供底稿引用和口头沟通。
         row = append_row(summary_ws, [pair_id(*key), item["company_a"], item["company_b"], item["relation_type"],
-            risk_text(item["max_level"]), item["evidence"][:180] + ("…（完整见明细）" if len(item["evidence"]) > 180 else ""),
+            risk_text(item["max_level"]), clue_summary(item),
             item["dimensions"], item["hit_count"], "查看全部证据", item["suggestion"],
-            "存在数据缺口，详见缺口页" if set(key) & incomplete else "", "", ""])
+            "存在数据缺口，详见缺口页" if set(key) & incomplete else "", "", "", f"对-{index:02d}"])
         summary_rows[key] = row
     for row, key in overview_links:
         keyed_link(overview.cell(row, 1), "关系核查汇总", pair_id(*key))
 
     evidence_ws = create_sheet(wb, "证据明细",
-        ["证据编号", "公司A", "公司B", "核查类别", "风险初判", "判断依据", "来源公司", "原始字段", "原始值", "原始文件 / 工作表 / 单元格", "返回汇总", "案例参考（非本次证据）"],
-        [24, 27, 27, 22, 12, 55, 27, 23, 44, 48, 18, 33])
+        ["证据编号", "公司A", "公司B", "核查类别", "风险初判", "判断依据", "来源公司", "原始字段", "原始值", "原始文件 / 工作表 / 单元格", "返回汇总", "案例参考（非本次证据）", "序号"],
+        [24, 27, 27, 22, 12, 55, 27, 23, 44, 48, 18, 33, 10])
     first_evidence = {}
+    evidence_seq = {}
     for number, hit in enumerate(all_hits, 1):
         key = pair_key(hit["company_a"], hit["company_b"])
+        evidence_id = hit.get("evidence_id", f"ZJ-{number:05d}")
+        if evidence_id not in evidence_seq:
+            # 同一证据编号的多行来源共享同一个"证-XX"序号，按首次出现顺序编号。
+            evidence_seq[evidence_id] = f"证-{len(evidence_seq) + 1:02d}"
         sources = hit.get("sources") or [None]
         for source in sources:
             source_text = (os.path.relpath(source["file"], Path(out_path).parent) + "\n" + source["sheet"] + "!" + source["cell"]) if source else "来源位置未记录，须人工核对"
-            row = append_row(evidence_ws, [hit.get("evidence_id", f"ZJ-{number:05d}"), hit["company_a"], hit["company_b"], hit["dimension"],
+            row = append_row(evidence_ws, [evidence_id, hit["company_a"], hit["company_b"], hit["dimension"],
                 risk_text(hit["level"]), hit["evidence"], source["company"] if source else "", source["field"] if source else "",
-                source["value"] if source else "", source_text, "返回对应汇总", hit["case_ref"]])
-            first_evidence.setdefault(key, hit.get("evidence_id", f"ZJ-{number:05d}"))
+                source["value"] if source else "", source_text, "返回对应汇总", hit["case_ref"], evidence_seq[evidence_id]])
+            first_evidence.setdefault(key, evidence_id)
             if source:
                 source_link(evidence_ws.cell(row, 10), source, out_path)
             if key in summary_rows:
@@ -332,8 +396,34 @@ def write_report(out_path, summary, all_hits, companies, dim, target_display, da
     gaps_ws = create_sheet(wb, "数据覆盖与缺口",
         ["公司 / 项目", "资料维度 / 类型", "取得或处理情况", "影响的核查", "说明", "来源文件", "取数任务创建时间"],
         [30, 25, 36, 38, 60, 48, 25])
+    # 维度级汇总置顶：全部公司都未取得的维度先总起一笔，说清影响面。
+    label_key = {label: key for key, (label, _impact) in DIMENSIONS.items()}
+    all_missing = []
+    for key, (label, _impact) in DIMENSIONS.items():
+        dim_rows = [record for record in coverage if record[1] == label]
+        if dim_rows and all(record[2] == "未取得" for record in dim_rows):
+            all_missing.append(label)
+    degraded_mode = any(item.get("category") == "取数通道降级" for item in limitations)
+    if all_missing:
+        impacts = "、".join(dict.fromkeys(DIMENSIONS[label_key[label]][1] for label in all_missing))
+        append_row(gaps_ws, ["全部核查对象", "维度级汇总",
+            f"本次未取得维度：{'、'.join(all_missing)}，影响全部 {len(names)} 家", impacts,
+            "相关核查规则整体受限" + ("；逐公司重复行已折叠，不再逐家列出" if degraded_mode else "；逐公司明细见下文"), "", ""])
+    # 涉及命中公司的缺口行排在前面并标记，读者先看到削弱结论的缺口。
+    ok_status = {"已取得记录", "明确无数据", "已核对范围，未见记录"}
+    candidate_keys = {"customer", "supplier", "abnormal"}
+    front, rest = [], []
     for record in coverage:
+        if degraded_mode and record[1] in all_missing:
+            continue
         values = list(record)
+        is_gap = record[2] not in ok_status and label_key.get(record[1]) not in candidate_keys
+        if record[0] in involved and is_gap:
+            values[4] = ("涉及命中；" + values[4]) if values[4] else "涉及命中，缺口直接削弱命中线索的强度"
+            front.append(values)
+        else:
+            rest.append(values)
+    for values in front + rest:
         if values[5]:
             values[5] = os.path.relpath(values[5], Path(out_path).parent)
         append_row(gaps_ws, values)
@@ -350,6 +440,7 @@ def write_report(out_path, summary, all_hits, companies, dim, target_display, da
     append_row(explanation, ["日期口径", "核查基准日用于计算成立时间等规则；原始记录日期见对应原表字段。取数任务创建时间不等同于记录生效日期。"])
     for ws in wb.worksheets:
         finish_sheet(ws, 5 if ws.title in {"关系核查汇总", "证据明细"} else None)
+    group_evidence_blocks(evidence_ws)
     for row, title in enumerate(list(SHEETS)[1:], 4):
         put(wb["目录"], row, 3, max(0, wb[title].max_row - 3))
     wb.active = 0

@@ -284,8 +284,15 @@ class ReportAcceptanceTests(unittest.TestCase):
         self.assertEqual({s["cell"] for s in hit["sources"] if Path(s["file"]).name == "股权质押.xlsx"}, {"D2", "F2"})
 
     def test_客商候选保留两种来源及实际单元格(self):
+        # 表头必须带"关联方名称"才会提取（不再按第 8 列猜位置）；本用例验证来源单元格定位准确。
         for name in ("客户.xlsx", "供应商.xlsx"):
-            write_dimension(self.root, name, [[1, "甲公司", "2026-01-01", 20, 1, "", "CNY", "乙公司"]])
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "原始记录"
+            ws.append(["序号", "公司名称", "公告时间", "金额", "占比（%）", "与本公司关系", "货币代码", "关联方名称"])
+            ws.append([1, "甲公司", "2026-01-01", 20, 1, "", "CNY", "乙公司"])
+            wb.save(self.root / name)
+            wb.close()
         candidates = extract_seed_export_candidates(self.root)
         self.assertEqual({item.relation_type for item in candidates}, {"公开客户关系", "公开供应商关系"})
         self.assertTrue(all(getattr(item, "sources", None) for item in candidates))

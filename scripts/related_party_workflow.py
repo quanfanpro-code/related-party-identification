@@ -86,6 +86,8 @@ class TaskState:
     raw_export_dir: str = ""
     degraded_export: bool = False
     degraded_reason: str = ""
+    as_of_date: str = ""
+    channel_warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -405,8 +407,16 @@ def read_name_list(path, column_name=None) -> NameListResult:
     )
 
 
-def extract_seed_export_candidates(data_dir) -> List[SeedExportCandidate]:
-    """从被审计单位完整导出的客户、供应商表提取一层候选。"""
+# 客户/供应商表的对手方列只认这几个表头名，命中不了就跳过并留痕
+COUNTERPARTY_HEADER_ALIASES = ("关联方名称", "客户名称", "供应商名称", "对手方名称", "交易对手方")
+
+
+def extract_seed_export_candidates(data_dir, warnings=None) -> List[SeedExportCandidate]:
+    """从被审计单位完整导出的客户、供应商表提取一层候选。
+
+    对手方列只认明确的表头名（关联方名称/客户名称/供应商名称等小别名集），
+    表头未命中时跳过该表并留 warning，不再按第 8 列猜位置。
+    """
     try:
         import openpyxl
     except ImportError:
@@ -433,10 +443,18 @@ def extract_seed_export_candidates(data_dir) -> List[SeedExportCandidate]:
             (
                 index
                 for index, header in enumerate(headers)
-                if header == "关联方名称"
+                if header in COUNTERPARTY_HEADER_ALIASES
             ),
-            7 if len(headers) >= 8 else None,
+            None,
         )
+        if counterparty_index is None:
+            if warnings is not None:
+                warnings.append(
+                    "{}表头未命中对手方列（{}），已跳过该表候选提取".format(
+                        filename, "、".join(COUNTERPARTY_HEADER_ALIASES)
+                    )
+                )
+            continue
         for row_number, row in enumerate(rows[1:], 2):
             candidate_name = ""
             if (
@@ -582,6 +600,8 @@ def _fallback_to_single_company(
 
     逐家取数只能覆盖基础工商信息、最新公示股东、实际控制人、最终受益人和对外投资，
     其余维度（客户、供应商、发票、变更记录、主要人员等）本次取不到，报告会如实标注为缺口。
+
+    保底文件固定写入 data_dir 下的"逐家取数补采"子目录，永不覆盖主目录里已有的批量导出证据。
     """
     state.degraded_export = True
     state.degraded_reason = str(reason)
@@ -590,11 +610,12 @@ def _fallback_to_single_company(
         "实际控制人、最终受益人、对外投资；客户、供应商、发票信息、变更记录、主要人员等"
         "维度本次无法取得，报告中如实标注为数据缺口。".format(reason)
     )
-    if warning not in state.discovery_warnings:
-        state.discovery_warnings.append(warning)
+    if warning not in state.channel_warnings:
+        state.channel_warnings.append(warning)
     save_task_state(state_path, state)
+    fallback_dir = Path(data_dir) / "逐家取数补采"
     try:
-        collect_by_company(client, company_names, Path(data_dir), fallback_reason=str(reason))
+        collect_by_company(client, company_names, fallback_dir, fallback_reason=str(reason))
     except SingleCompanyError as exc:
         save_task_state(state_path, state)
         raise ExportError(
@@ -671,8 +692,11 @@ def run_workflow(
             if len(names) - 1 > state.candidate_cap:
                 state.status = "needs_user_confirmation"
                 state.candidate_count = len(names) - 1
-                state.message_zh = "名单包含 {} 家候选，需用户确认后继续".format(
-                    state.candidate_count
+                state.message_zh = (
+                    "名单包含 {} 家候选，需用户确认后继续；"
+                    "确认后请以 --candidate-cap {} 重新运行 run 命令".format(
+                        state.candidate_count, state.candidate_count
+                    )
                 )
                 save_task_state(state_file, state)
                 return WorkflowResult(
@@ -720,8 +744,9 @@ def run_workflow(
                 dict.fromkeys(state.report_paths + [str(data_dir)])
             )
             if not state.discovery_completed:
+                seed_warnings = []
                 seed_candidates = (
-                    [] if state.degraded_export else extract_seed_export_candidates(data_dir)
+                    [] if state.degraded_export else extract_seed_export_candidates(data_dir, warnings=seed_warnings)
                 )
                 discovery_result = discoverer(
                     state.audited_entity, client=client,
@@ -732,7 +757,7 @@ def run_workflow(
                 )
                 state.candidate_count = len(discovery_result.candidates)
                 state.candidate_records = [asdict(candidate) for candidate in discovery_result.candidates.values()]
-                state.discovery_warnings = list(discovery_result.warnings)
+                state.discovery_warnings = list(discovery_result.warnings) + seed_warnings
                 state.discovery_completed = discovery_result.status == "completed"
                 state.status = discovery_result.status
                 state.message_zh = discovery_result.message_zh
@@ -749,16 +774,16 @@ def run_workflow(
             object_records = state.candidate_records
             candidate_count = state.candidate_count
             if object_records and state.degraded_export:
-                # 保底路线：候选企业也用逐家取数补齐，维度文件按全部企业重写一次
+                # 保底路线：候选企业也用逐家取数补齐，维度文件在补采子目录按全部企业重写一次
                 try:
                     collect_by_company(
                         client,
                         [state.audited_entity] + [record["name"] for record in object_records],
-                        data_dir,
+                        Path(data_dir) / "逐家取数补采",
                         fallback_reason=state.degraded_reason,
                     )
                 except SingleCompanyError as exc:
-                    state.discovery_warnings.append(
+                    state.channel_warnings.append(
                         "逐家取数补充候选企业时未完整取得：{}".format(exc)
                     )
                     save_task_state(state_file, state)
@@ -783,12 +808,13 @@ def run_workflow(
         data_dir=data_dir,
         target_names=[state.audited_entity],
         output_path=report_path,
-        as_of_date=date.today(),
+        as_of_date=date.fromisoformat(state.as_of_date) if state.as_of_date else date.today(),
         disclosed_parties=set(state.disclosed_parties) if state.disclosed_parties else None,
         task_mode=state.mode,
         additional_data_dirs=additional_data_dirs,
         object_records=object_records,
         discovery_warnings=state.discovery_warnings,
+        channel_warnings=state.channel_warnings,
         scope_metadata={
             "初始穿透层数": state.initial_depth,
             "批准穿透层数": state.approved_depth,
@@ -847,6 +873,8 @@ def main(argv=None) -> int:
     run_parser.add_argument("--input", action="append", default=[])
     run_parser.add_argument("--output-dir", required=True)
     run_parser.add_argument("--approved-depth", type=int, default=2)
+    run_parser.add_argument("--as-of-date", default="", help="核查基准日，格式 YYYY-MM-DD；缺省为运行当天")
+    run_parser.add_argument("--candidate-cap", type=int, default=100, help="候选企业数量上限；确认超出上限后用更大的值重新运行即可继续")
     resume_parser = subparsers.add_parser("resume", help="恢复关联方识别任务")
     resume_parser.add_argument("--state-path", required=True, type=Path)
     subparsers.add_parser("validate", help="验证 skill 分发包")
@@ -878,6 +906,8 @@ def main(argv=None) -> int:
             input_files=args.input,
             output_dir=args.output_dir,
             approved_depth=args.approved_depth,
+            candidate_cap=args.candidate_cap,
+            as_of_date=args.as_of_date,
         )
         login = (
             {"status": "authenticated"}

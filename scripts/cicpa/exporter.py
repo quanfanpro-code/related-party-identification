@@ -41,6 +41,10 @@ class ExportValidationError(ExportError):
     """下载文件未通过结构或企业名称验证。"""
 
 
+class ExportWorkbookIncomplete(ExportValidationError):
+    """维度工作簿残缺（无法打开或连表头都没有），按缺文件处理。"""
+
+
 REQUIRED_DIMENSIONS = (
     ("S0000002", "基础工商信息"),
     ("S0000006", "股东信息"),
@@ -64,7 +68,11 @@ REQUIRED_DIMENSIONS = (
     ("S0000101", "微信公众号"),
 )
 DIMENSION_NAMES = dict(REQUIRED_DIMENSIONS)
-TERMINAL_DIMENSION_RESULTS = {"completed", "no_data"}
+# 终态集合：completed/no_data 是正常结果；missing 是"没拿到"（重试上限后放弃），
+# 与 no_data（服务端确认没有）严格区分，报告侧对非 no_data 的缺失文件走"缺失维度"通道
+TERMINAL_DIMENSION_RESULTS = {"completed", "no_data", "missing"}
+# 同一维度在下载批次中缺文件达到此次数后，记 missing 终态，不再无限重排
+MISSING_FILE_RETRY_LIMIT = 2
 
 
 def initial_dimension_groups() -> List[List[str]]:
@@ -102,6 +110,8 @@ class ExportState:
     direct_delivery: bool = False
     required_dimensions: List[str] = field(default_factory=list)
     dimension_results: Dict[str, str] = field(default_factory=dict)
+    # 各维度"下载批次里没有它的文件"的累计次数，用于缺文件重试上限
+    missing_counts: Dict[str, int] = field(default_factory=dict)
     pending_groups: List[List[str]] = field(default_factory=list)
     active_group: List[str] = field(default_factory=list)
     batch_history: List[Dict[str, Any]] = field(default_factory=list)
@@ -415,7 +425,7 @@ class CicpaExporter:
         state: ExportState,
         state_path: Path,
     ) -> None:
-        """批量轮询失败计入连续次数；单维度保留两个轮询窗口。"""
+        """批量轮询失败计入连续次数；单维度保留两个轮询窗口，仍失败则记 missing 继续。"""
         state.poll_windows += 1
         if len(state.active_group) > 1 and not state.single_dimension_mode:
             self._record_batch_failure(
@@ -428,17 +438,46 @@ class CicpaExporter:
             state.message_zh = "第一个轮询窗口结束，保留当前维度组继续等待"
             save_export_state(state_path, state)
             return
-        if len(state.active_group) == 1:
-            code = state.active_group[0]
-            state.status = "paused"
-            state.message_zh = "单维度 {}（{}）经过两个轮询窗口仍失败，已暂停".format(
-                code,
-                DIMENSION_NAMES.get(code, code),
-            )
-            save_export_state(state_path, state)
-            return
-        state.status = "paused"
-        state.message_zh = "单维度下载经过两个轮询窗口仍失败，已暂停"
+        # 单维度两个轮询窗口仍失败：记为未取得并继续后续维度，不再暂停等人处理
+        self._mark_active_group_missing(
+            state,
+            state_path,
+            detail="经过两个轮询窗口仍未取得文件",
+        )
+
+    def _mark_active_group_missing(
+        self,
+        state: ExportState,
+        state_path: Path,
+        *,
+        detail: str,
+    ) -> None:
+        """把活动组里尚未完成的维度记为 missing（未取得），清空活动组后继续。"""
+        unfinished = [
+            code
+            for code in state.active_group
+            if state.dimension_results.get(code) not in TERMINAL_DIMENSION_RESULTS
+        ]
+        for code in unfinished:
+            state.dimension_results[code] = "missing"
+        names = "、".join(
+            "{}（{}）".format(code, DIMENSION_NAMES.get(code, code))
+            for code in unfinished
+        )
+        state.batch_history.append(
+            {
+                "dimensions": list(unfinished),
+                "task_id": state.task_id,
+                "result": "marked_missing",
+                "detail": detail,
+            }
+        )
+        state.active_group = []
+        state.task_id = ""
+        state.task_name = ""
+        state.poll_windows = 0
+        state.status = "waiting"
+        state.message_zh = "维度 {}{}，记为未取得并继续后续维度".format(names, detail)
         save_export_state(state_path, state)
 
     @staticmethod
@@ -520,9 +559,14 @@ class CicpaExporter:
             members = archive.infolist()
             for member in members:
                 destination = (extract_dir / member.filename).resolve()
-                if os.path.commonpath([str(extract_root), str(destination)]) != str(
-                    extract_root
-                ):
+                try:
+                    outside = os.path.commonpath(
+                        [str(extract_root), str(destination)]
+                    ) != str(extract_root)
+                except ValueError:
+                    # 跨盘符等无法比较的路径按校验失败处理，不裸抛 ValueError
+                    raise ExportValidationError("ZIP 中存在无法校验安全性的路径")
+                if outside:
                     raise ExportValidationError("ZIP 中存在越出暂存目录的路径")
             for member in members:
                 destination = extract_dir / member.filename
@@ -622,21 +666,32 @@ class CicpaExporter:
         except ImportError as exc:
             raise ExportValidationError("缺少 openpyxl，无法验证导出文件") from exc
 
-        workbook = openpyxl.load_workbook(
-            workbook_path,
-            read_only=True,
-            data_only=True,
-        )
         try:
-            sheet = workbook.active
-            sheet.reset_dimensions()
-            rows = list(sheet.iter_rows(values_only=True))
-        finally:
-            workbook.close()
+            workbook = openpyxl.load_workbook(
+                workbook_path,
+                read_only=True,
+                data_only=True,
+            )
+            try:
+                sheet = workbook.active
+                sheet.reset_dimensions()
+                rows = list(sheet.iter_rows(values_only=True))
+            finally:
+                workbook.close()
+        except (OSError, zipfile.BadZipFile) as exc:
+            # 损坏到无法打开的工作簿属于残缺文件，按缺文件处理
+            raise ExportWorkbookIncomplete(
+                "{} 无法作为工作簿打开，按缺文件处理".format(workbook_path.name)
+            ) from exc
+        if not rows or not any(value not in (None, "") for value in rows[0]):
+            # 连表头都没有的残缺文件不能当作"无数据"结论，按缺文件处理
+            raise ExportWorkbookIncomplete(
+                "{} 连表头都没有，按缺文件处理".format(workbook_path.name)
+            )
         data_rows = [row for row in rows[1:] if any(value not in (None, "") for value in row)]
         if not data_rows:
             return "no_data"
-        headers = [str(value or "").strip() for value in (rows[0] if rows else [])]
+        headers = [str(value or "").strip() for value in rows[0]]
         name_indexes = [
             index
             for index, header in enumerate(headers)
@@ -728,7 +783,7 @@ class CicpaExporter:
         task: Dict[str, Any],
         state_path: Path,
     ) -> List[str]:
-        """逐维保留本批有效结果，只重排缺失维度。"""
+        """逐维保留本批有效结果，只重排缺失维度；缺文件达到重试上限后记 missing。"""
         url = str(task.get("url") or "")
         if not url:
             raise ExportValidationError("对应下载任务没有下载地址")
@@ -754,13 +809,40 @@ class CicpaExporter:
         try:
             self._safe_extract(archive_path, extract_dir)
         except ExportValidationError as exc:
-            state.status = "paused"
-            state.message_zh = str(exc)
+            # 整批无法安全解包（含跨盘符路径）：视同本批各维度均未取得文件，留痕后继续
+            requeue = []
+            marked = []
+            for code in state.active_group:
+                if state.dimension_results.get(code) in TERMINAL_DIMENSION_RESULTS:
+                    continue
+                if self._count_missing_file(state, code, requeue):
+                    marked.append(code)
+            state.batch_history.append(
+                {
+                    "dimensions": list(state.active_group),
+                    "task_id": str(task.get("task_id") or state.task_id),
+                    "archive_path": str(archive_path),
+                    "completed_dimensions": [],
+                    "missing_dimensions": list(requeue),
+                    "marked_missing_dimensions": list(marked),
+                    "result": "archive_invalid",
+                    "detail": str(exc),
+                }
+            )
+            if requeue:
+                state.pending_groups.insert(0, requeue)
+            finished = self._close_batch(state, archive_path, staging_dir)
+            state.message_zh = (
+                self._completion_message(state)
+                if finished
+                else "本批 ZIP 未通过安全校验（{}），未取得维度将重新触发".format(exc)
+            )
             save_export_state(state_path, state)
-            raise
+            return []
 
         completed = []
         missing = []
+        marked_missing = []
         try:
             explicit_no_data = self._statistics_no_data_dimensions(
                 extract_dir,
@@ -787,14 +869,22 @@ class CicpaExporter:
                 if code in explicit_no_data:
                     state.dimension_results[code] = "no_data"
                     completed.append(code)
-                else:
-                    missing.append(code)
+                elif self._count_missing_file(state, code, missing):
+                    marked_missing.append(code)
                 continue
             try:
                 result = self._validate_dimension_workbook(
                     workbook_path,
                     state.company_names,
                 )
+            except ExportWorkbookIncomplete:
+                # 残缺文件（无法打开或连表头都没有）按缺文件处理，不写成"无数据"结论
+                if code in explicit_no_data:
+                    state.dimension_results[code] = "no_data"
+                    completed.append(code)
+                elif self._count_missing_file(state, code, missing):
+                    marked_missing.append(code)
+                continue
             except ExportValidationError as exc:
                 state.status = "paused"
                 state.message_zh = str(exc)
@@ -803,20 +893,21 @@ class CicpaExporter:
             target = staging_dir / workbook_path.name
             if target.exists():
                 if self._file_sha256(target) != self._file_sha256(workbook_path):
-                    state.status = "paused"
-                    state.message_zh = "{} 与既有证据内容冲突，未覆盖旧文件".format(
-                        workbook_path.name
-                    )
+                    # 同名不同内容：新文件改名保留双份、沿用旧文件、留痕后继续
+                    renamed = self._conflict_copy_path(staging_dir, workbook_path)
+                    shutil.copy2(workbook_path, renamed)
                     state.batch_history.append(
                         {
-                            "dimensions": list(state.active_group),
+                            "dimensions": [code],
                             "task_id": str(task.get("task_id") or state.task_id),
                             "archive_path": str(archive_path),
                             "result": "file_conflict",
+                            "detail": "{} 两次取数内容不一致：沿用旧文件，新文件已改名 {}".format(
+                                workbook_path.name,
+                                renamed.name,
+                            ),
                         }
                     )
-                    save_export_state(state_path, state)
-                    raise ExportValidationError(state.message_zh)
             else:
                 shutil.copy2(workbook_path, target)
             state.dimension_results[code] = result
@@ -829,13 +920,75 @@ class CicpaExporter:
                 "archive_path": str(archive_path),
                 "completed_dimensions": list(completed),
                 "missing_dimensions": list(missing),
-                "result": "partial" if missing else "completed",
+                "marked_missing_dimensions": list(marked_missing),
+                "result": "partial" if (missing or marked_missing) else "completed",
             }
         )
         if len(state.active_group) > 1 and not state.single_dimension_mode:
             state.batch_failure_streak = 0
         if missing:
             state.pending_groups.insert(0, missing)
+        finished = self._close_batch(state, archive_path, staging_dir)
+        if finished:
+            state.message_zh = self._completion_message(state)
+        elif marked_missing:
+            state.message_zh = (
+                "本批已保留 {} 个维度，{} 个维度记为未取得，仅继续未完成维度".format(
+                    len(completed),
+                    len(marked_missing),
+                )
+            )
+        else:
+            state.message_zh = "本批已保留 {} 个维度，仅继续未完成维度".format(len(completed))
+        save_export_state(state_path, state)
+        return completed
+
+    @staticmethod
+    def _count_missing_file(state: ExportState, code: str, requeue: List[str]) -> bool:
+        """累计"下载批次里没有该维度文件"的次数；达到上限记 missing 终态并返回 True。"""
+        state.missing_counts[code] = state.missing_counts.get(code, 0) + 1
+        if state.missing_counts[code] >= MISSING_FILE_RETRY_LIMIT:
+            state.dimension_results[code] = "missing"
+            return True
+        requeue.append(code)
+        return False
+
+    @staticmethod
+    def _conflict_copy_path(staging_dir: Path, workbook_path: Path) -> Path:
+        """同名冲突时给新文件改名：原名.本批.xlsx；再冲突追加序号，永不覆盖。"""
+        candidate = staging_dir / "{}.本批{}".format(
+            workbook_path.stem, workbook_path.suffix
+        )
+        serial = 1
+        while candidate.exists():
+            serial += 1
+            candidate = staging_dir / "{}.本批{}{}".format(
+                workbook_path.stem, serial, workbook_path.suffix
+            )
+        return candidate
+
+    @staticmethod
+    def _completion_message(state: ExportState) -> str:
+        """完成消息如实统计：有未取得维度时不得笼统说"全部完成"。"""
+        total = len(state.required_dimensions)
+        missing_total = sum(
+            1
+            for code in state.required_dimensions
+            if state.dimension_results.get(code) == "missing"
+        )
+        if missing_total:
+            return "完成 {} 个维度，{} 个维度未取得".format(
+                total - missing_total, missing_total
+            )
+        return "{} 个关联方核查维度已全部完成".format(total)
+
+    def _close_batch(
+        self,
+        state: ExportState,
+        archive_path: Path,
+        staging_dir: Path,
+    ) -> bool:
+        """清空活动组并刷新完成状态；返回是否全部维度进入终态。"""
         state.active_group = []
         state.task_id = ""
         state.task_name = ""
@@ -847,13 +1000,7 @@ class CicpaExporter:
             for code in state.required_dimensions
         )
         state.status = "completed" if finished else "waiting"
-        state.message_zh = (
-            "20 个关联方核查维度已全部完成"
-            if finished
-            else "本批已保留 {} 个维度，仅继续未完成维度".format(len(completed))
-        )
-        save_export_state(state_path, state)
-        return completed
+        return finished
 
     def run_to_completion(
         self,
@@ -862,7 +1009,7 @@ class CicpaExporter:
         *,
         max_polls: int = 18,
     ) -> Path:
-        """串行驱动全部未完成维度，只有 20 维闭环后才返回。"""
+        """串行驱动全部未完成维度，全部进入终态（含 missing）后才返回。"""
         while True:
             if state.status == "paused":
                 raise ExportError(state.message_zh or "维度导出已暂停")
@@ -873,7 +1020,7 @@ class CicpaExporter:
             if finished:
                 state.status = "completed"
                 state.extract_dir = state.extract_dir or state.staging_dir
-                state.message_zh = "20 个关联方核查维度已全部完成"
+                state.message_zh = self._completion_message(state)
                 save_export_state(state_path, state)
                 return Path(state.extract_dir)
             if not state.active_group and not self.trigger_next_group(state, state_path):

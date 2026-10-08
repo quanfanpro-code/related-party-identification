@@ -34,7 +34,7 @@ import sys
 import hashlib
 import json
 import html
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Optional
@@ -152,8 +152,13 @@ def load_workbook_safe(path, errors=None):
             wb.close()
 
 
-def build_dim_index(data_dir, errors=None, limitations=None, file_info=None):
-    """加载所有维度文件，返回 {key: {公司名: [行...]}} 索引。"""
+def build_dim_index(data_dir, errors=None, limitations=None, file_info=None, dimension_scan=None):
+    """加载所有维度文件，返回 {key: {公司名: [行...]}} 索引。
+
+    dimension_scan 传入时，逐维度登记"是否在任一目录出现 + 最后看到的完成状态"，
+    由调用方在读完所有目录后统一判缺失（同名维度任一目录提供即不算缺失，且只报一次）；
+    不传则沿用旧的即时追加 limitations 行为。
+    """
     index = {}
     metadata_path = Path(data_dir) / "取数说明.json"
     metadata = {}
@@ -176,12 +181,18 @@ def build_dim_index(data_dir, errors=None, limitations=None, file_info=None):
     for key, fname in FILES.items():
         path = os.path.join(data_dir, fname)
         terminal = metadata.get("dimension_results", {}).get(codes.get(fname), "")
-        if not os.path.exists(path) and limitations is not None and fname in codes and terminal != "no_data":
-            limitations.append({
-                "category": "缺失维度",
-                "source": fname,
-                "message": "本次导出未提供该维度，相关规则可能受限",
-            })
+        if fname in codes:
+            exists = os.path.exists(path)
+            if dimension_scan is not None:
+                entry = dimension_scan.setdefault(fname, {"present": False, "terminal": terminal})
+                entry["present"] = entry["present"] or exists
+                entry["terminal"] = terminal
+            elif not exists and terminal != "no_data" and limitations is not None:
+                limitations.append({
+                    "category": "缺失维度",
+                    "source": fname,
+                    "message": "本次导出未提供该维度，相关规则可能受限",
+                })
         rows, ncols = load_workbook_safe(path, errors=errors)
         minimum = {"basic": 23, "shareholder": 7, "shareholder_new": 6, "actual_controller": 3,
                    "ultimate_beneficiary": 6, "main_persons": 4, "core_team": 5, "invest_new": 5,
@@ -547,14 +558,31 @@ def all_addresses(c: Company):
 # 七类有效核查证据
 # ============================================================
 
-def rule1_fingerprint(ca: Company, cb: Company):
-    """维度1: 工商指纹重合（地址/电话/邮箱/网址）。"""
+def rule1_fingerprint(ca: Company, cb: Company, scarcity=None):
+    """维度1: 工商指纹重合（地址/电话/邮箱/网址）。
+
+    scarcity 为全样本共用计数 {"phone"/"email"/"address"/"email_domain": Counter}；
+    同一指纹被 5 家及以上共用时视为代理记账/集中注册特征，降为中级并注明。
+    """
     hits = []
+    counters = scarcity or {}
+    phone_count = counters.get("phone", {})
+    address_count = counters.get("address", {})
+    domain_count = counters.get("email_domain", {})
+    email_count = counters.get("email", {})
     # 电话
     common_phones = ca.phones & cb.phones
     if common_phones:
         complete = any(len(number) >= 10 for number in common_phones)
-        hits.append(("phone", HARD if complete else MEDIUM, f"联系电话相同: {','.join(sorted(common_phones))}" + ("" if complete else "（缺区号，地域待核实）"), "蓝山/卓朗/达志科技案",
+        shared = max((phone_count.get(number, 0) for number in common_phones), default=0)
+        notes = []
+        if not complete:
+            notes.append("缺区号，地域待核实")
+        if shared >= 5:
+            notes.append(f"该电话为{shared}家共用，疑似代理记账或集中注册")
+        level = HARD if (complete and shared < 5) else MEDIUM
+        suffix = f"（{'；'.join(notes)}）" if notes else ""
+        hits.append(("phone", level, f"联系电话相同: {','.join(sorted(common_phones))}" + suffix, "蓝山/卓朗/达志科技案",
                      trace(ca, "phone", common_phones, normalize=normalize_phones) + trace(cb, "phone", common_phones, normalize=normalize_phones)))
     else:
         # 电话号段相邻（座机同一区号+局向，末位不同 → 同一办公地点的连续号码）
@@ -562,23 +590,37 @@ def rule1_fingerprint(ca: Company, cb: Company):
         if seg:
             hits.append(("phone_segment", MEDIUM, f"座机号段相邻: {seg[0]}↔{seg[1]}（待核实，不能据此认定同一地点）", "蓝山科技案(号段相邻)",
                          trace(ca, "phone", [seg[0]], normalize=normalize_phones) + trace(cb, "phone", [seg[1]], normalize=normalize_phones)))
-    # 邮箱完全相同
+    # 邮箱完全相同（同一邮箱被 5 家及以上共用时同样视为代理记账特征）
     common_emails = set(ca.emails) & set(cb.emails)
     if common_emails:
-        hits.append(("email", HARD, f"邮箱完全相同: {','.join(sorted(common_emails))}", "爱康科技案",
+        shared = max((email_count.get(address, 0) for address in common_emails), default=0)
+        note = f"（该邮箱为{shared}家共用，疑似代理记账或集中注册）" if shared >= 5 else ""
+        level = MEDIUM if shared >= 5 else HARD
+        hits.append(("email", level, f"邮箱完全相同: {','.join(sorted(common_emails))}" + note, "爱康科技案",
                      trace(ca, "email", common_emails, normalize=lambda x: normalize_emails(x)[0]) + trace(cb, "email", common_emails, normalize=lambda x: normalize_emails(x)[0])))
     # 邮箱同域名（非公共）
     common_domains = set(ca.email_domains) & set(cb.email_domains)
     if common_domains:
-        hits.append(("email_domain", HARD, f"企业邮箱同域名: {','.join(sorted(common_domains))}", "天沃/爱康/志高机械案",
-                     trace(ca, "email", common_domains, normalize=lambda x: normalize_emails(x)[1]) + trace(cb, "email", common_domains, normalize=lambda x: normalize_emails(x)[1])))
+        shared = max((domain_count.get(domain, 0) for domain in common_domains), default=0)
+        if shared >= 5:
+            hits.append(("email_domain", MEDIUM, f"企业邮箱同域名: {','.join(sorted(common_domains))}（该域名为{shared}家共用，疑似代理记账或集中注册）", "天沃/爱康/志高机械案",
+                         trace(ca, "email", common_domains, normalize=lambda x: normalize_emails(x)[1]) + trace(cb, "email", common_domains, normalize=lambda x: normalize_emails(x)[1])))
+        else:
+            hits.append(("email_domain", HARD, f"企业邮箱同域名: {','.join(sorted(common_domains))}", "天沃/爱康/志高机械案",
+                         trace(ca, "email", common_domains, normalize=lambda x: normalize_emails(x)[1]) + trace(cb, "email", common_domains, normalize=lambda x: normalize_emails(x)[1])))
     # 地址
     for a1 in all_addresses(ca):
         for a2 in all_addresses(cb):
             rel = address_relationship(a1, a2)
             if rel:
                 kind, desc = rel
-                level = HARD if kind == "exact" else (MEDIUM if kind == "same_building" else MEDIUM)
+                level = MEDIUM
+                if kind == "exact":
+                    shared = address_count.get(normalize_address(a1), 0)
+                    if shared >= 5:
+                        desc += f"；该地址为{shared}家共用，疑似集中注册或商务秘书地址"
+                    else:
+                        level = HARD
                 case = "天沃科技案(同楼同座)" if kind != "exact" else "达志科技案(地址相同)"
                 hits.append(("address", level, f"{desc}；甲方地址：{a1}；乙方地址：{a2}", case,
                              trace(ca, "address", [a1], normalize=strip_html) + trace(cb, "address", [a2], normalize=strip_html)))
@@ -680,7 +722,9 @@ def rule3_counterparty_profile(ca: Company, cb: Company, target_set, as_of_date=
         flags.append("经营范围极简")
     if flags:
         hits.append(("profile", MEDIUM if len(flags) >= 2 else LOW,
-                     "；".join(flags), "专网通信/爱康案", trace(party, "profile")))
+                     f"对手方{party.name}自身特征异常：{'；'.join(flags)}"
+                     f"（依据对手方自身公开资料，与被审计单位是否存在真实交易需核实）",
+                     "专网通信/爱康案", trace(party, "profile")))
     return hits
 
 
@@ -694,16 +738,20 @@ def parse_percentage(value):
 
 
 def rule5_equity(ca: Company, cb: Company):
-    """识别双向直接投资和共同股东；持股证据与最终控制认定分开。"""
+    """识别双向直接投资和共同股东；持股证据与最终控制认定分开。曾用名视同现名接通。"""
     hits = []
     for parent, child in ((ca, cb), (cb, ca)):
-        ratios = [ratio for name, ratio in parent.investments + parent.holdings if name == child.name]
-        ratios += [ratio for name, ratio, _ in child.shareholders if name == parent.name]
+        child_names = {normalize_name(n) for n in ({child.name} | set(child.former_names))}
+        parent_names = {normalize_name(n) for n in ({parent.name} | set(parent.former_names))}
+        invest_names = [name for name, _ in parent.investments + parent.holdings if normalize_name(name) in child_names]
+        sh_names = [name for name, _, _ in child.shareholders if normalize_name(name) in parent_names]
+        ratios = [ratio for name, ratio in parent.investments + parent.holdings if normalize_name(name) in child_names]
+        ratios += [ratio for name, ratio, _ in child.shareholders if normalize_name(name) in parent_names]
         if ratios:
             parsed = [parse_percentage(ratio) for ratio in ratios]
             level = HARD if all(ratio is not None and ratio >= 20 for ratio in parsed) else MEDIUM
             hits.append(("invest", level, f"{parent.name} 对 {child.name} 的持股线索；记录比例：{'、'.join(sorted(set(str(r) or '未披露' for r in ratios)))}（控制或重大影响待核实）", "投资关系",
-                trace(parent, "invest", [child.name], normalize=normalize_name) + trace(child, "shareholder", [parent.name], normalize=normalize_name)
+                trace(parent, "invest", invest_names, normalize=normalize_name) + trace(child, "shareholder", sh_names, normalize=normalize_name)
                 + trace(parent, "names", [parent.name], normalize=normalize_name) + trace(child, "names", [child.name], normalize=normalize_name)))
     common_sh = {name for name in {s[0] for s in ca.shareholders} & {s[0] for s in cb.shareholders}
                  if strip_html(name) and name not in {"国有企业", "自然人", "法人"} and not is_public_authority(name)}
@@ -717,12 +765,12 @@ def rule5_equity(ca: Company, cb: Company):
 def rule6_historical(ca: Company, cb: Company):
     """维度6: 历史关联痕迹。"""
     hits = []
+    split_names = lambda x: [normalize_name(v) for v in re.split(r"[,，;；、]", strip_html(x))]
     # 曾用名命中
     cb_names = {cb.name} | set(cb.former_names)
     ca_names = {ca.name} | set(ca.former_names)
     former_hit = (set(ca.former_names) & cb_names) | (set(cb.former_names) & ca_names)
     if former_hit:
-        split_names = lambda x: [normalize_name(v) for v in re.split(r"[,，;；、]", strip_html(x))]
         hits.append(("former_name", MEDIUM, f"曾用名匹配: {','.join(sorted(former_hit))}", "历史关联",
                      trace(ca, "names", former_hit, normalize=split_names) + trace(cb, "names", former_hit, normalize=split_names)))
     # 曾任法人：A 现法人曾是 B 的法人（法人变更记录）
@@ -741,17 +789,39 @@ def rule6_historical(ca: Company, cb: Company):
                 hits.append(("past_address", MEDIUM,
                              f"{ca.name}曾用地址与{cb.name}已取得地址重合：{before}", "历史关联",
                              trace(ca, "past_address", [before], normalize=strip_html) + trace(cb, "address", [normalize_address(before)], normalize=normalize_address)))
+    # 历史股东痕迹：变更记录"投资人/股东"项的变更前文本出现对方现名或曾用名
+    for _, item, before, _after in ca.changes:
+        if not before or ("投资人" not in item and "股东" not in item):
+            continue
+        before_compact = re.sub(r"\s+", "", before)
+        for name in sorted({cb.name} | set(cb.former_names)):
+            normalized = normalize_name(name)
+            if len(normalized) < 4 or normalized not in before_compact:
+                continue
+            hits.append(("past_investor", MEDIUM,
+                         f"{ca.name}历史股东变更记录中出现{name}", "非关联化线索（ST新亿/扬子新材案）",
+                         trace(ca, "past_investor", None,
+                               row_match=lambda row, n=normalized: n in re.sub(r"\s+", "", str(row_value(row, 4, ""))))
+                         + trace(cb, "names", [normalized], normalize=split_names)))
+            break
     return hits
 
 
 def equity_path_hits(companies):
-    """在已取得资料内寻找最多五层的多数持股路径，不传递少数股权。"""
+    """在已取得资料内寻找最多五层的多数持股路径，不传递少数股权。曾用名归一到现名建边。"""
+    alias = {}
+    for name, company in companies.items():
+        alias[normalize_name(name)] = name
+        for former in company.former_names:
+            alias.setdefault(normalize_name(former), name)
     records = defaultdict(list)
     for company in companies.values():
         for child, ratio in company.investments + company.holdings:
-            records[(company.name, child)].append((parse_percentage(ratio), trace(company, "invest", [child], normalize=normalize_name)))
+            canonical_child = alias.get(normalize_name(child), child)
+            records[(company.name, canonical_child)].append((parse_percentage(ratio), trace(company, "invest", [child], normalize=normalize_name)))
         for parent, ratio, _ in company.shareholders:
-            records[(parent, company.name)].append((parse_percentage(ratio), trace(company, "shareholder", [parent], normalize=normalize_name)))
+            canonical_parent = alias.get(normalize_name(parent), parent)
+            records[(canonical_parent, company.name)].append((parse_percentage(ratio), trace(company, "shareholder", [parent], normalize=normalize_name)))
     graph = defaultdict(dict)
     for (parent, child), values in records.items():
         if parent and child and parent != child and not is_public_authority(parent) and all(ratio is not None and ratio > 50 for ratio, _ in values):
@@ -843,12 +913,30 @@ def rule8_intangible(ca: Company, cb: Company):
 # 主比对 & 汇总
 # ============================================================
 
-def compare_pair(ca, cb, dim, target_set, as_of_date=None, errors=None):
+def rule9_dual_role(ca, cb, dim):
+    """维度9: 既客又供 — 同一对手方同时出现在客户表和供应商表（交易真实性线索）。"""
+    hits = []
+    for owner, other in ((ca, cb), (cb, ca)):
+        other_names = {normalize_name(n) for n in ({other.name} | set(other.former_names))}
+        customers = {strip_html(str(r[7])) for r in dim.get("customer", {}).get(owner.name, [])
+                     if len(r) > 7 and strip_html(str(r[7] or ""))}
+        suppliers = {strip_html(str(r[7])) for r in dim.get("supplier", {}).get(owner.name, [])
+                     if len(r) > 7 and strip_html(str(r[7] or ""))}
+        for name in sorted(customers & suppliers):
+            if normalize_name(name) not in other_names:
+                continue
+            hits.append(("dual_role", MEDIUM,
+                         f"{owner.name}的客户与供应商名单同时出现{name}（既客又供）", "交易真实性线索（资金/货物双向流动）",
+                         trace(owner, "dual_role", [name], normalize=strip_html)
+                         + trace(other, "names", [normalize_name(name)], normalize=normalize_name)))
+    return hits
+
+
+def compare_pair(ca, cb, dim, target_set, as_of_date=None, errors=None, scarcity=None):
     """对一对公司跑全部规则，返回 [hit_dict...]。target_set 为审计对象群（含子公司）。"""
     results = []
-    # rule3 需要方向参数（判断谁是审计主体、谁是对手方），单独调用；其余规则统一双参数
+    # rule3 需要方向参数、rule1 需要全样本稀缺性计数、rule9 需要客户/供应商明细，均单独调用；其余规则统一双参数
     rules_2arg = [
-        (rule1_fingerprint, "工商指纹重合"),
         (rule2_personnel, "关键人员重合"),
         (rule5_equity, "股权控制穿透"),
         (rule6_historical, "历史关联痕迹"),
@@ -895,6 +983,38 @@ def compare_pair(ca, cb, dim, target_set, as_of_date=None, errors=None):
                 "source": "客商异常画像",
                 "message": f"{ca.name}↔{cb.name}: {e}",
             })
+    # rule1: 工商指纹重合（需要全样本稀缺性计数，共用度高的指纹降级）
+    try:
+        for field_key, level, evidence, case, sources in rule1_fingerprint(ca, cb, scarcity):
+            results.append({
+                "company_a": ca.name, "company_b": cb.name,
+                "dimension": "工商指纹重合", "field": field_key,
+                "level": level, "evidence": evidence, "case_ref": case, "sources": unique_sources(sources),
+            })
+    except Exception as e:
+        print(f"  ⚠️ 规则异常 工商指纹重合 {ca.name}↔{cb.name}: {e}", file=sys.stderr)
+        if errors is not None:
+            errors.append({
+                "category": "规则异常",
+                "source": "工商指纹重合",
+                "message": f"{ca.name}↔{cb.name}: {e}",
+            })
+    # rule9: 既客又供（需要 dim 里的客户/供应商明细）
+    try:
+        for field_key, level, evidence, case, sources in rule9_dual_role(ca, cb, dim):
+            results.append({
+                "company_a": ca.name, "company_b": cb.name,
+                "dimension": "客商异常画像", "field": field_key,
+                "level": level, "evidence": evidence, "case_ref": case, "sources": unique_sources(sources),
+            })
+    except Exception as e:
+        print(f"  ⚠️ 规则异常 既客又供 {ca.name}↔{cb.name}: {e}", file=sys.stderr)
+        if errors is not None:
+            errors.append({
+                "category": "规则异常",
+                "source": "既客又供",
+                "message": f"{ca.name}↔{cb.name}: {e}",
+            })
     return results
 
 
@@ -916,13 +1036,21 @@ def aggregate(all_hits, target_set):
         # 按公司对最高风险分级，最终认定由人工复核填写。
         has_hard = any(l == HARD for l in levels)
         has_medium = any(l == MEDIUM for l in levels)
+        corroborated = False
         if has_hard:
             is_related = "高风险线索，待核实"
             suggestion = "实施函证、实地走访、资金流水核对；询问管理层，核实关系并评估披露"
         elif has_medium:
             is_related = "中风险线索，待核实"
-            suggestion = "结合交易背景进一步核查；关注交易商业合理性"
+            # 三条以上中级线索且横跨三个以上不同维度 → 独立线索相互印证，建议程序升级为高风险档（结论仍保持中级）
+            medium_hits = [h for h in hits if h["level"] == MEDIUM]
+            corroborated = len(medium_hits) >= 3 and len({h["dimension"] for h in medium_hits}) >= 3
+            if corroborated:
+                suggestion = "实施函证、实地走访、资金流水核对；询问管理层，核实关系并评估披露"
+            else:
+                suggestion = "结合交易背景进一步核查；关注交易商业合理性"
         else:
+            corroborated = False
             is_related = "低风险线索，待核实"
             suggestion = "记录备查，必要时跟进"
         ca, cb = pair
@@ -937,7 +1065,12 @@ def aggregate(all_hits, target_set):
             "company_a": ca, "company_b": cb, "relation_type": relation,
             "is_related": is_related, "max_level": max_level,
             "hit_count": len(hits), "dimensions": "、".join(dims),
-            "evidence": " | ".join(sorted({h["evidence"] for h in hits})),
+            "evidence": ("多条独立线索相互印证；" if corroborated else "") + " | ".join(sorted({h["evidence"] for h in hits})),
+            # evidence_items 供报告按整条取舍：同一级别里短的先列，摘要不把一条证据从中间切断。
+            "evidence_items": [text for text, _rank in sorted(
+                {h["evidence"]: level_rank(h["level"]) for h in hits}.items(),
+                key=lambda pair: (-pair[1], len(pair[0]), pair[0]))],
+            "corroborated": corroborated,
             "suggestion": suggestion,
             "case_ref": "、".join(sorted({h["case_ref"] for h in hits})),
             "hits": hits,
@@ -981,6 +1114,7 @@ def run_check(
     additional_data_dirs=None,
     object_records=None,
     discovery_warnings=None,
+    channel_warnings=None,
 ):
     """运行核查并返回结构化结果，命令行只负责参数转换。"""
     data_path = Path(data_dir)
@@ -1002,18 +1136,33 @@ def run_check(
     print(f"📂 加载数据: {data_path}")
     file_info = []
     dim = {}
+    dimension_scan = {}
     data_paths = [data_path] + [Path(path) for path in (additional_data_dirs or [])]
     # 离线重读同一交付目录时，也纳入已经完成的候选批次。
     candidate_dir = data_path / "候选公司原始导出"
     if candidate_dir.is_dir() and candidate_dir not in data_paths:
         data_paths.append(candidate_dir)
+    # 逐家取数保底文件固定在"逐家取数补采"子目录，同样自动纳入比对。
+    fallback_dir = data_path / "逐家取数补采"
+    if fallback_dir.is_dir() and fallback_dir not in data_paths:
+        data_paths.append(fallback_dir)
     for folder in dict.fromkeys(data_paths):
         if not folder.is_dir():
             raise FileNotFoundError(f"数据目录不存在: {folder}")
-        part = build_dim_index(folder, errors=errors, limitations=limitations, file_info=file_info)
+        part = build_dim_index(folder, errors=errors, limitations=limitations, file_info=file_info,
+                               dimension_scan=dimension_scan)
         for key, by_name in part.items():
             for name, rows in by_name.items():
                 dim.setdefault(key, {}).setdefault(name, []).extend(rows)
+    # 全部目录读完后统一报缺失（任一目录提供该维度即不算缺失，同名只报一次）。
+    for fname, scanned in dimension_scan.items():
+        if scanned["present"] or scanned["terminal"] == "no_data":
+            continue
+        limitations.append({
+            "category": "缺失维度",
+            "source": fname,
+            "message": "本次导出未提供该维度，相关规则可能受限",
+        })
     company_names = list(dim.get("basic", {}).keys())
     if not company_names:
         raise ValueError("基础工商信息.xlsx 无数据或未找到，无法核查")
@@ -1050,6 +1199,18 @@ def run_check(
         ])
         data_completeness[name] = f"{filled}/6"
 
+    # 全样本指纹稀缺性计数：同一指纹被多家公司共用时降级（代理记账/集中注册特征）
+    scarcity = {"phone": Counter(), "email": Counter(), "address": Counter(), "email_domain": Counter()}
+    for company in companies.values():
+        for number in company.phones:
+            scarcity["phone"][number] += 1
+        for address in set(company.emails):
+            scarcity["email"][address] += 1
+        for domain in set(company.email_domains):
+            scarcity["email_domain"][domain] += 1
+        for addr in {normalize_address(a) for a in all_addresses(company)} - {""}:
+            scarcity["address"][addr] += 1
+
     all_hits = []
     names = sorted(companies)
     for company_a, company_b in combinations(names, 2):
@@ -1061,6 +1222,7 @@ def run_check(
                 target_set,
                 as_of_date=check_date,
                 errors=errors,
+                scarcity=scarcity,
             )
         )
     all_hits.extend(equity_path_hits(companies))
@@ -1109,10 +1271,15 @@ def run_check(
     if not records:
         # 离线和直接核查同样保留公开交易对手来源，但不据此生成风险命中。
         from scripts.related_party_workflow import extract_seed_export_candidates
+        extract_warnings = []
         for folder in dict.fromkeys(data_paths):
             records.extend({"name": item.name, "relation_type": item.relation_type,
                             "reasons": [item.relation_type], "paths": [], "notes": [], "sources": list(item.sources)}
-                           for item in extract_seed_export_candidates(folder))
+                           for item in extract_seed_export_candidates(folder, warnings=extract_warnings))
+        for warning in extract_warnings:
+            limitations.append({"category": "候选发现不完整", "source": "客户/供应商表", "message": warning})
+    for warning in channel_warnings or []:
+        limitations.append({"category": "取数通道降级", "source": "逐家取数保底", "message": warning})
     for warning in discovery_warnings or []:
         limitations.append({"category": "候选发现不完整", "source": "主动发现", "message": warning})
     write_report(
