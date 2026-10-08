@@ -207,63 +207,64 @@ class Test曾用名股权(unittest.TestCase):
 
 class Test复核优化20261008(unittest.TestCase):
     """2026-10-08 独立复核（逻辑与报告可读性）发现修复的行为测试：
-    概览按是否涉及被审计单位排序、高共用度指纹收敛、取数范围外不计缺口。"""
+    名单按风险排序、集中注册类线索收敛、取数范围外不计缺口。"""
 
     def overview_rows(self, path):
         wb = openpyxl.load_workbook(path)
         try:
-            return [row for row in wb["核查概览"].iter_rows(min_row=4, values_only=True) if row[0]]
+            return [row for row in wb["核查结论"].iter_rows(min_row=4, values_only=True) if row[0]]
         finally:
             wb.close()
 
-    def test_概览涉及被审计单位的线索排在其他对象之间前面(self):
+    def test_名单按风险从高到低排列(self):
         with tempfile.TemporaryDirectory() as d:
             write_xlsx(d, "基础工商信息.xlsx", BASIC_HEADER, [
                 basic_row("甲测试有限公司", 1),
-                basic_row("乙测试有限公司", 2, phone="13911112222"),
-                basic_row("丙测试有限公司", 3, phone="13911112222"),
+                basic_row("乙测试有限公司", 2, phone="13900000001"),
+                basic_row("丙测试有限公司", 3),
             ])
             write_xlsx(d, "商标.xlsx", TRADEMARK_HEADER,
-                       [[1, "甲测试有限公司", "共同牌"], [2, "乙测试有限公司", "共同牌"]])
+                       [[1, "甲测试有限公司", "共同牌"], [2, "丙测试有限公司", "共同牌"]])
             result = run(d)
-            clues = [row for row in self.overview_rows(result.output_path) if "↔" in str(row[0])]
-            self.assertEqual(len(clues), 2)
-            self.assertIn("甲测试有限公司", clues[0][0],
-                          "涉及被审计单位的中风险线索应排在其他对象之间的高风险线索前面")
-            self.assertNotIn("甲测试有限公司", clues[1][0])
-            # 汇总表同样按该顺序排列
+            clues = [row for row in self.overview_rows(result.output_path)
+                     if str(row[1] or "") in {"高", "中", "低"}]
+            # 乙与被审计单位撞手机号是高风险，丙与被审计单位撞商标是中风险
+            self.assertEqual([(row[0], row[1]) for row in clues],
+                             [("乙测试有限公司", "高"), ("丙测试有限公司", "中")],
+                             "名单应按风险从高到低排")
             wb = openpyxl.load_workbook(result.output_path)
             try:
-                rows = [row for row in wb["关系核查汇总"].iter_rows(min_row=4, values_only=True) if row[0]]
+                rows = [row for row in wb["疑似关联方复核底稿"].iter_rows(min_row=4, values_only=True) if row[0]]
             finally:
                 wb.close()
-            self.assertIn("甲测试有限公司", rows[0][1] + rows[0][2])
+            self.assertEqual([row[1] for row in rows], ["乙测试有限公司", "丙测试有限公司"],
+                             "复核底稿同样按风险排")
 
-    def test_全部命中来自高共用度指纹的公司对收敛(self):
+    def test_全部命中来自高共用度指纹的公司收敛(self):
         with tempfile.TemporaryDirectory() as d:
             rows = [basic_row(f"共用地址测试{i}有限公司", i, address="北京市海淀区中关村大街27号")
                     for i in range(1, 7)]
             write_xlsx(d, "基础工商信息.xlsx", BASIC_HEADER, rows)
             result = run(d, target="共用地址测试1有限公司")
-            self.assertEqual(len(result.summary), 15, "6 家两两 15 对，命中保留不丢")
+            self.assertEqual(len(result.summary), 5, "只与被审计单位比对：被审计单位对另外 5 家各一条")
             self.assertTrue(all(item["converged"] for item in result.summary))
             self.assertTrue(all(hit["level"] == MEDIUM for hit in result.hits), "收敛不改命中本身的等级")
             overview = self.overview_rows(result.output_path)
-            clues = [row for row in overview if "↔" in str(row[0])]
-            self.assertEqual(clues, [], "收敛对不逐对列入重点线索")
-            folded = [row for row in overview if str(row[0]).startswith("高共用度指纹收敛")]
+            clues = [row for row in overview if str(row[1] or "") in {"高", "中", "低"}]
+            self.assertEqual(clues, [], "收敛公司不列入疑似关联方名单")
+            folded = [row for row in overview if str(row[0]).startswith("另有")]
             self.assertEqual(len(folded), 1)
-            self.assertIn("15", folded[0][0])
-            metrics = {row[0]: row[1] for row in overview}
-            self.assertEqual(metrics.get("其中高共用度指纹收敛公司对数"), 15)
+            self.assertIn("5 家", folded[0][0])
             wb = openpyxl.load_workbook(result.output_path)
             try:
-                summary_rows = [row for row in wb["关系核查汇总"].iter_rows(min_row=4, values_only=True) if row[0]]
+                metrics = {row[0]: row[1] for row in wb["核查范围与数量说明"].iter_rows(min_row=4, values_only=True) if row[0]}
+                summary_rows = [row for row in wb["疑似关联方复核底稿"].iter_rows(min_row=4, values_only=True) if row[0]]
             finally:
                 wb.close()
-            self.assertEqual(len(summary_rows), 15)
-            self.assertTrue(all(str(row[5]).startswith("【收敛") for row in summary_rows),
-                            "汇总摘要应带收敛标记")
+            self.assertEqual(metrics.get("其中只有集中注册类线索的公司数"), 5)
+            self.assertEqual(len(summary_rows), 5)
+            self.assertTrue(all(str(row[4]).startswith("【收敛") for row in summary_rows),
+                            "复核底稿摘要应带收敛标记")
 
     def test_取数范围外不计入缺口_范围内未取得计入(self):
         from scripts.related_party_check import Company

@@ -1,5 +1,5 @@
 ﻿# 报告可读性（复核发现修复批次四第 21-26 项）的行为测试。
-# 用真实引擎 run_check 生成七表报告到临时目录，再用 openpyxl 回读断言；
+# 用真实引擎 run_check 生成八表报告到临时目录，再用 openpyxl 回读断言；
 # 涉及"取数通道降级"提示的用例直接调用 write_report（该类别由保底通道批次产生）。
 from contextlib import redirect_stdout
 from io import StringIO
@@ -54,7 +54,7 @@ def run(folder, target="甲测试有限公司", **kwargs):
 def overview_rows(path):
     wb = openpyxl.load_workbook(path)
     try:
-        return [row for row in wb["核查概览"].iter_rows(min_row=4, values_only=True) if row[0]]
+        return [row for row in wb["核查结论"].iter_rows(min_row=4, values_only=True) if row[0]]
     finally:
         wb.close()
 
@@ -66,7 +66,7 @@ def overview_names(path):
 def gap_rows(path):
     wb = openpyxl.load_workbook(path)
     try:
-        return [row for row in wb["数据覆盖与缺口"].iter_rows(min_row=4, values_only=True)
+        return [row for row in wb["各家资料取得情况"].iter_rows(min_row=4, values_only=True)
                 if any(value is not None for value in row)]
     finally:
         wb.close()
@@ -79,29 +79,48 @@ def write_phone_hit_pair(folder):
 
 
 class Test概览结论先行(unittest.TestCase):
-    def test_概览首行是自动结论含义_风险对数先于重点线索_指标殿后(self):
+    def test_概览首行直接给出发现了什么(self):
         with tempfile.TemporaryDirectory() as d:
             write_phone_hit_pair(d)
             result = run(d)
             names = overview_names(result.output_path)
-            self.assertEqual(names[0], "自动结论含义")
-            self.assertLess(names.index("高风险公司对数"), names.index("重点线索"))
-            self.assertLess(names.index("中风险公司对数"), names.index("重点线索"))
-            self.assertLess(names.index("低风险公司对数"), names.index("重点线索"))
-            self.assertLess(names.index("重点线索"), names.index("范围与口径指标"))
-            self.assertLess(names.index("范围与口径指标"), names.index("纳入范围公司数"))
-            self.assertLess(names.index("范围与口径指标"), names.index("存在数据缺口公司数"))
+            self.assertEqual(names[0], "本次发现了什么")
+            self.assertLess(names.index("本次发现了什么"), names.index("疑似关联方名单"))
+            self.assertNotIn("纳入核查的公司数（不含被审计单位）", names, "范围与数量说明已移到独立工作表")
 
-    def test_取数通道降级提示紧跟自动结论含义(self):
+    def test_首行结论写明家数与风险分档(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_phone_hit_pair(d)
+            result = run(d)
+            first = overview_rows(result.output_path)[0]
+            self.assertIn("发现疑似关联方 1 家", first[3])
+            self.assertIn("高风险 1 家", first[3])
+            self.assertIn("乙测试有限公司", str(overview_rows(result.output_path)))
+
+    def test_范围与数量说明在独立工作表(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_phone_hit_pair(d)
+            result = run(d)
+            wb = openpyxl.load_workbook(result.output_path)
+            try:
+                self.assertIn("核查范围与数量说明", wb.sheetnames)
+                names = [row[0] for row in wb["核查范围与数量说明"].iter_rows(min_row=4, values_only=True) if row[0]]
+            finally:
+                wb.close()
+            for expected in ("被审计单位", "纳入核查的公司数（不含被审计单位）", "发现疑似关联方", "存在资料缺口的公司数"):
+                self.assertIn(expected, names)
+
+    def test_取数通道降级提示紧跟必读说明(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "报告.xlsx"
             write_report(out, [], [], {}, "甲测试有限公司",
                          limitations=[{"category": "取数通道降级", "source": "批量导出",
                                        "message": "批量通道连续失败，已改用逐家取数补采"}])
             names = overview_names(out)
-            self.assertEqual(names[0], "自动结论含义")
-            self.assertEqual(names[1], "取数通道降级提示")
-            self.assertIn("逐家取数补采", overview_rows(out)[1][1])
+            self.assertEqual(names[0], "本次发现了什么")
+            self.assertEqual(names[1], "这份报告能说明什么（必读）")
+            self.assertEqual(names[2], "取数通道降级提示")
+            self.assertIn("逐家取数补采", overview_rows(out)[2][3])
 
     def test_零命中时声明不提供完整性保证(self):
         with tempfile.TemporaryDirectory() as d:
@@ -119,7 +138,7 @@ class Test概览结论先行(unittest.TestCase):
                        [[1, "甲测试有限公司", "账号甲", "同名公众号"], [2, "乙测试有限公司", "账号乙", "同名公众号"]])
             result = run(d)
             rows = overview_rows(result.output_path)
-            self.assertEqual({row[0]: row[1] for row in rows}["低风险公司对数"], 1)
+            self.assertIn("低风险 1 家", rows[0][3])
             text = "\n".join(str(value) for row in rows for value in row if value)
             self.assertIn("本结果不提供关联方完整性保证", text)
 
@@ -131,8 +150,8 @@ class Test概览结论先行(unittest.TestCase):
             self.assertNotIn("本结果不提供关联方完整性保证", text)
 
 
-class Test重点线索关系列(unittest.TestCase):
-    def test_线索行第三列是与审计对象的关系(self):
+class Test名单疑似关系列(unittest.TestCase):
+    def test_名单直接列出公司_风险_疑似关系_发现(self):
         with tempfile.TemporaryDirectory() as d:
             write_xlsx(d, "基础工商信息.xlsx", BASIC_HEADER,
                        [basic_row("甲测试有限公司", 1),
@@ -143,17 +162,19 @@ class Test重点线索关系列(unittest.TestCase):
             result = run(d)
             wb = openpyxl.load_workbook(result.output_path)
             try:
-                ws = wb["核查概览"]
-                self.assertEqual(ws.cell(3, 3).value, "与审计对象的关系")
-                clues = [row for row in ws.iter_rows(min_row=4, values_only=True)
-                         if row[0] and "↔" in str(row[0])]
+                ws = wb["核查结论"]
+                header_row = next(row[0].row for row in ws.iter_rows(min_row=4)
+                                  if row[0].value == "疑似关联方名单")
+                headers = [ws.cell(header_row, col).value for col in range(1, 5)]
+                clues = [row for row in ws.iter_rows(min_row=header_row + 1, values_only=True)
+                         if row[0] and str(row[1] or "") in {"高", "中", "低"}]
             finally:
                 wb.close()
-            self.assertEqual(len(clues), 2)
-            target_clue = next(row for row in clues if "甲测试有限公司" in row[0])
-            other_clue = next(row for row in clues if "甲测试有限公司" not in row[0])
-            self.assertEqual(target_clue[2], "审计对象与核查对象")
-            self.assertEqual(other_clue[2], "其他核查对象之间（不推定与审计对象关联）")
+            self.assertEqual(headers, ["疑似关联方名单", "风险等级", "与被审计单位的疑似关系", "发现了什么（完整证据见证据明细）"])
+            # 乙丙互相撞商标但与被审计单位无关，不再出现；只剩与被审计单位撞电话的乙。
+            self.assertEqual([row[0] for row in clues], ["乙测试有限公司"])
+            self.assertEqual(clues[0][1], "高")
+            self.assertEqual(clues[0][2], "注册地址、电话或邮箱与被审计单位相同")
 
 
 class Test证据明细行块分组(unittest.TestCase):
@@ -192,15 +213,17 @@ class Test对人可读序号(unittest.TestCase):
                         basic_row("乙测试有限公司", 2, phone="13900000001"),
                         basic_row("丙测试有限公司", 3)])
             write_xlsx(d, "商标.xlsx", ["序号", "公司名称", "商标名"],
-                       [[1, "乙测试有限公司", "共用品牌"], [2, "丙测试有限公司", "共用品牌"]])
+                       [[1, "甲测试有限公司", "共用品牌"], [2, "丙测试有限公司", "共用品牌"]])
             result = run(d)
             wb = openpyxl.load_workbook(result.output_path)
             try:
-                rows = list(wb["关系核查汇总"].iter_rows(min_row=4, values_only=True))
+                rows = list(wb["疑似关联方复核底稿"].iter_rows(min_row=4, values_only=True))
             finally:
                 wb.close()
             self.assertEqual(len(rows), 2)
-            self.assertEqual([row[-1] for row in rows], ["对-01", "对-02"])
+            self.assertEqual([row[1] for row in rows], ["乙测试有限公司", "丙测试有限公司"],
+                             "底稿按风险从高到低排，高风险公司在前")
+            self.assertEqual([row[-1] for row in rows], ["01", "02"])
             self.assertTrue(all(str(row[0]).startswith("GX-") for row in rows))
 
     def test_明细序号按证据编号连续且同一证据同号(self):
@@ -304,10 +327,14 @@ class Test缺口计数分两档(unittest.TestCase):
             }, ensure_ascii=False), encoding="utf-8")
             result = run(d, object_records=[{"name": "丁测试有限公司", "relation_type": "公开客户关系",
                                              "reasons": ["公开客户关系"]}])
-            overview = {row[0]: row[1] for row in overview_rows(result.output_path)}
-            self.assertEqual(overview["存在数据缺口公司数"], 2)
-            self.assertEqual(overview["其中重度缺口公司数"], 1, "丁公司未取得基础工商记录应为重度")
-            self.assertEqual(overview["其中轻度缺口公司数"], 1, "乙公司仅缺个别字段应为轻度")
+            wb = openpyxl.load_workbook(result.output_path)
+            try:
+                quality = {row[0]: row[1] for row in wb["核查范围与数量说明"].iter_rows(min_row=4, values_only=True) if row[0]}
+            finally:
+                wb.close()
+            self.assertEqual(quality["存在资料缺口的公司数"], 2)
+            self.assertEqual(quality["其中重度缺口公司数"], 1, "丁公司未取得基础工商记录应为重度")
+            self.assertEqual(quality["其中轻度缺口公司数"], 1, "乙公司仅缺个别字段应为轻度")
 
 
 class Test对手方画像措辞(unittest.TestCase):
@@ -388,8 +415,8 @@ class Test摘要按整条证据截断(unittest.TestCase):
             result = run(d)
             wb = openpyxl.load_workbook(result.output_path)
             try:
-                summary_cell = next(row[5].value for row in wb["关系核查汇总"].iter_rows(min_row=4)
-                                    if row[5].value)
+                summary_cell = next(row[4].value for row in wb["疑似关联方复核底稿"].iter_rows(min_row=4)
+                                    if row[4].value)
             finally:
                 wb.close()
             all_evidence = {h["evidence"] for h in result.hits}
@@ -409,7 +436,7 @@ class Test摘要按整条证据截断(unittest.TestCase):
             self._write_three_hits(d)
             result = run(d)
             rows = overview_rows(result.output_path)
-            clue_row = next(row for row in rows if row[0] and "↔" in str(row[0]))
+            clue_row = next(row for row in rows if row[0] == "乙测试有限公司")
             self.assertIn("…（另", clue_row[3])
             self.assertNotIn("…（完整见明细）", clue_row[3])
 

@@ -1,4 +1,4 @@
-﻿# 七张工作表共享同一核查结果，使用 Excel 原生导航、筛选和相对文件链接。
+﻿# 八张工作表共享同一核查结果，使用 Excel 原生导航、筛选和相对文件链接。
 from collections import Counter
 from datetime import datetime
 import hashlib
@@ -14,13 +14,14 @@ from openpyxl.workbook.defined_name import DefinedName
 
 
 SHEETS = {
-    "目录": "先看概览，再按公司关系查看证据；所有原始资料保持原样。",
-    "核查概览": "先看结论与重点线索，再查范围、口径和数据缺口。",
-    "核查对象与来源": "每家公司为何纳入、取得什么资料、实际查到哪一步。",
-    "关系核查汇总": "每对有命中的公司一行；自动初判与人工复核意见分开。",
+    "目录": "先看核查结论，再按公司查看证据；所有原始资料保持原样。",
+    "核查结论": "本次发现了哪些疑似关联方：叫什么名字、风险多高、与被审计单位疑似什么关系、依据是什么。",
+    "疑似关联方复核底稿": "每家疑似关联方一行；自动初判与人工复核意见分开填写。",
     "证据明细": "每条证据的判断依据及实际参与匹配的原始字段，可按证据编号筛选。",
-    "数据覆盖与缺口": "每家公司、每个维度的取得情况及其对核查的影响。",
-    "任务说明": "任务入口、范围、日期、原始目录和判断口径。",
+    "纳入核查的公司名单": "每家公司为何纳入、取得什么资料、实际查到哪一步。",
+    "各家资料取得情况": "每家公司、每个维度的资料取得情况及其对核查的影响。",
+    "核查范围与数量说明": "本次核查覆盖的范围，以及报告里各项数字是怎么算出来的。",
+    "核查任务说明": "任务入口、范围、日期、原始目录和判断口径。",
 }
 NAVY = "1F4E79"
 PALE = "D6E4F0"
@@ -89,6 +90,21 @@ def append_row(ws, values):
             part = value[offset * 32767:(offset + 1) * 32767] if isinstance(value, str) and len(value) > 32767 else value
             put(ws, start + offset, column, part)
     return start
+
+
+def section_header(ws, values):
+    """同一张工作表里第二张表的列头：与第 3 行表头同款深蓝样式，肉眼可辨两张表的分界。
+    finish_sheet 会把正文行统一改回浅色，调用方需在 finish_sheet 之后用 restyle_section_headers 还原。"""
+    return append_row(ws, values)
+
+
+def restyle_section_headers(ws, rows):
+    for row in rows:
+        for cell in ws[row]:
+            cell.fill = PatternFill("solid", fgColor=NAVY)
+            cell.font = Font(name="微软雅黑", size=10, color="FFFFFF", bold=True)
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[row].height = 30
 
 
 def link(cell, sheet, row):
@@ -294,67 +310,67 @@ def write_report(out_path, summary, all_hits, companies, target_display,
     for title, description in list(SHEETS.items())[1:]:
         row = append_row(ws, [title, description, None])
         link(ws.cell(row, 1), title, 1)
-    overview = create_sheet(wb, "核查概览", ["项目", "数量或情况", "与审计对象的关系", "统计口径 / 下一步"], [32, 48, 33, 76])
-    # 结论先行：先给读懂报告所需的前提、降级提示和分级结果，再列重点线索，范围与口径注解殿后。
-    append_row(overview, ["自动结论含义",
-        scope.get("自动结论含义", "仅为线索初判；未命中不代表不存在关联关系；其他核查对象之间的命中不推定与被审计单位关联"),
-        "", "理解本报告全部数字与线索的前提"])
+    overview = create_sheet(wb, "核查结论", ["项目", "数量", "", "内容 / 说明"], [34, 10, 36, 82])
+    # 第一行直接给结论：发现了几家、各是什么风险。读者打开报告十秒内要知道答案。
+    checked_count = len(set(companies) - target_set)
+    if summary:
+        risk_parts = [f"{risk}风险 {counts[risk]} 家" for risk in ("高", "中", "低") if counts[risk]]
+        conclusion = f"在被审计单位“{target_display}”之外，本次共核查 {checked_count} 家公司，发现疑似关联方 {len(summary)} 家（{'、'.join(risk_parts)}），名单见下表。"
+    else:
+        conclusion = f"在被审计单位“{target_display}”之外，本次共核查 {checked_count} 家公司，未发现疑似关联方。"
+    append_row(overview, ["本次发现了什么", "", "", conclusion])
+    append_row(overview, ["这份报告能说明什么（必读）", "", "",
+        scope.get("本次核查结论（必读）", "本报告只是自动初判线索，不是审计结论：列出的疑似关联方需经审计程序核实；未发现不代表不存在关联关系，关联方是否完整须结合其他审计程序确认")])
     for item in limitations:
         if item.get("category") == "取数通道降级":
-            append_row(overview, ["取数通道降级提示", item.get("message", ""), "",
-                f"来源：{item.get('source', '')}；受影响范围详见数据覆盖与缺口"])
-    for record in [
-        ["高风险公司对数", counts["高"], "", "按该公司对最高风险等级统计，待核实"],
-        ["中风险公司对数", counts["中"], "", "与高、低风险公司对互不重复"],
-        ["低风险公司对数", counts["低"], "", "低风险线索仍是命中，不表示没有问题"],
-    ]:
-        append_row(overview, record)
+            append_row(overview, ["取数通道降级提示", "", "",
+                f"{item.get('message', '')}（来源：{item.get('source', '')}；受影响范围详见各家资料取得情况）"])
     if not counts["高"] and not counts["中"]:
-        append_row(overview, ["重要提示", "本结果不提供关联方完整性保证", "",
-            "零命中或全部为低风险线索；未命中不代表不存在关联关系，关联方完整性须结合其他审计程序确认"])
-    append_row(overview, ["重点线索", "点击公司对进入汇总", "与审计对象的关系",
-        "涉及被审计单位的线索排在前面，组内按风险排序；完整原文见证据明细"])
+        append_row(overview, ["重要提示", "", "",
+            "本结果不提供关联方完整性保证：未发现高、中风险线索；未发现不代表不存在关联关系，关联方是否完整须结合其他审计程序确认"])
+    if summary:
+        # 名单是这张表的正文：公司叫什么、风险多高、疑似什么关系、发现了什么，一眼看完。
+        clue_header_row = section_header(overview,
+            ["疑似关联方名单", "风险等级", "与被审计单位的疑似关系", "发现了什么（完整证据见证据明细）"])
+    else:
+        clue_header_row = None
     overview_links = []
     converged_items = [item for item in summary if item.get("converged")]
     for item in summary:
         if item.get("converged"):
-            continue  # 高共用度指纹收敛对不逐对列入重点线索，折叠为一行说明
-        row = append_row(overview, [f"{item['company_a']} ↔ {item['company_b']}", risk_text(item["max_level"]) + "风险线索",
-                                   item["relation_type"],
-                                   clue_summary(item)])
+            continue  # 只有集中注册类线索的公司不列入名单，折叠为一行说明
+        row = append_row(overview, [item["company"], risk_text(item["max_level"]),
+                                    item["relation_to_target"],
+                                    clue_summary(item)])
         overview_links.append((row, pair_key(item["company_a"], item["company_b"])))
     if converged_items:
-        append_row(overview, [f"高共用度指纹收敛（{len(converged_items)} 对公司对）",
-            "全部命中来自 5 家及以上共用的地址/电话/邮箱，疑似集中注册或代理记账",
-            "",
-            "审计价值低，不逐对列入重点线索；逐对明细见关系核查汇总后段及证据明细"])
-    if not summary:
-        append_row(overview, ["本次未形成命中", "请结合数据缺口阅读", "", "只说明实际取得资料中的规则结果"])
-    append_row(overview, ["范围与口径指标", "以下为范围、进度与统计口径注解", "", ""])
+        append_row(overview, [f"另有 {len(converged_items)} 家公司未列入名单", "", "",
+            "这些公司与被审计单位撞上的地址或电话同时被 5 家及以上公司共用，疑似代理记账或集中注册，审计价值低；逐家明细见复核底稿后段"])
+    quality = create_sheet(wb, "核查范围与数量说明", ["项目", "数量", "这个数字怎么算出来的"], [36, 46, 92])
     metrics = [
-        ["被审计单位", target_display, "", "自动初判须结合审计程序核实"],
-        ["纳入范围公司数", len(names), "", "包括被审计单位、候选及资料未取得的核查对象，按名称去重"],
-        ["主动发现候选公司数", len(set(objects) - target_set) if task_mode == "discovery" else 0, "", "只有主动发现模式计入；候选不等于关联方"],
-        ["取得基础资料公司数", len(companies), "", "基础工商表可读取并已构建为核查对象"],
-        ["实际尝试比对公司对数", scope.get("实际尝试比对公司对数", len(companies) * (len(companies) - 1) // 2), "", "两家公司组成一对，任一规则失败另列数据缺口"],
-        ["命中公司对数", len(summary), "", "同一公司对命中多条证据，只计一对"],
-        ["证据条数", len({hit.get("evidence_id", str(i)) for i, hit in enumerate(all_hits)}), "", "按证据编号去重；明细的多个来源行不重复计数"],
+        ["被审计单位", target_display, "本次核查以被审计单位为基准，每家公司都与它比对"],
+        ["纳入核查的公司数（不含被审计单位）", len([n for n in names if n not in target_set]), "候选及资料未取得的也算在内，按名称去重"],
+        ["其中由程序主动发现的公司数", len(set(objects) - target_set) if task_mode == "discovery" else 0, "只有主动发现模式才有；被发现不等于关联方"],
+        ["取得基础资料的公司数（不含被审计单位）", len(set(companies) - target_set), "基础工商表可读取、实际参与了比对的公司"],
+        ["与被审计单位实际比对的次数", scope.get("被审计单位与各公司的实际比对数", checked_count), "每家取得基础资料的公司与被审计单位比对一次"],
+        ["发现疑似关联方", len(summary), "同一家公司命中多条证据只计一家"],
+        ["证据条数", len({hit.get("evidence_id", str(i)) for i, hit in enumerate(all_hits)}), "按证据编号去重；同一条证据的多个来源行不重复计数"],
     ]
     if converged_items:
-        metrics.append(["其中高共用度指纹收敛公司对数", len(converged_items), "",
-            "全部命中来自 5 家及以上共用指纹，疑似集中注册或代理记账，已列于汇总后段"])
+        metrics.append(["其中只有集中注册类线索的公司数", len(converged_items),
+            "撞上的地址或电话被 5 家及以上公司共用，疑似代理记账或集中注册，已列于复核底稿后段"])
     metrics += [
-        ["存在数据缺口公司数", len(incomplete), "", "缺资料、空字段或规则失败；具体影响见数据覆盖与缺口"],
-        ["其中重度缺口公司数", len(severe), "", "未取得基础工商记录，或缺失维度达 10 个及以上；缺口实质削弱核查结论"],
-        ["其中轻度缺口公司数", len(incomplete - severe), "", "其余存在缺口的公司；个别维度或字段缺失，影响相对有限"],
-        ["读取、字段或规则错误条数", len(errors), "", "错误不能当作未命中"],
-        ["发现过程提示条数", sum(item.get("category") == "候选发现不完整" for item in limitations), "", "发现过程中取数失败会影响候选范围完整性"],
+        ["存在资料缺口的公司数", len(incomplete), "缺资料、空字段或规则执行失败；具体影响见各家资料取得情况"],
+        ["其中重度缺口公司数", len(severe), "未取得基础工商记录，或缺失维度达 10 个及以上；缺口实质削弱核查结论"],
+        ["其中轻度缺口公司数", len(incomplete - severe), "其余存在缺口的公司；个别维度或字段缺失，影响相对有限"],
+        ["读取、字段或规则错误条数", len(errors), "有错误不能当作未发现"],
+        ["发现过程提示条数", sum(item.get("category") == "候选发现不完整" for item in limitations), "发现过程中取数失败会影响候选范围是否完整"],
     ]
     for record in metrics:
-        append_row(overview, record)
+        append_row(quality, record)
 
-    roster = create_sheet(wb, "核查对象与来源",
-        ["公司名称", "对象来源", "发现理由 / 名单来源", "层级", "直接来源", "关系路径", "资料情况", "比对结果", "法定代表人", "成立日期", "注册资本（人民币元）", "参保人数", "来源记录 / 说明"],
+    roster = create_sheet(wb, "纳入核查的公司名单",
+        ["公司名称", "怎么进名单的", "发现理由 / 名单来源", "层级", "直接来源", "关系路径", "资料情况", "核查结果", "法定代表人", "成立日期", "注册资本（人民币元）", "参保人数", "来源记录 / 说明"],
         [30, 21, 42, 9, 28, 54, 23, 28, 17, 15, 20, 12, 52])
     involved = {value for item in summary for value in (item["company_a"], item["company_b"])}
     for name in names:
@@ -364,9 +380,12 @@ def write_report(out_path, summary, all_hits, companies, target_display,
         reason = "；".join(record.get("reasons", []))
         if record.get("source_files"):
             reason += "\n名单文件：" + "；".join(Path(p).name for p in record["source_files"])
-        outcome = "未纳入比对，缺少基础资料" if not company else ("未形成公司对" if len(companies) < 2 else ("已尝试比对，发现线索" if name in involved else "已尝试比对，未命中"))
+        if name in target_set:
+            outcome = "被审计单位（比对基准）"
+        else:
+            outcome = "未纳入比对，缺少基础资料" if not company else ("比对发现疑似关联线索" if name in involved else "已比对，未发现关联线索")
         if any(item.get("category") == "规则异常" and name in item.get("message", "") for item in errors):
-            outcome = "部分规则执行失败；" + ("已有命中线索" if name in involved else "其余已执行规则未命中")
+            outcome = "部分规则执行失败；" + ("已有命中线索" if name in involved else "其余已执行规则未发现")
         source_notes = []
         for source in record.get("sources", []):
             if source.get("file"):
@@ -375,27 +394,27 @@ def write_report(out_path, summary, all_hits, companies, target_display,
                 ratio_text = "比例未取得" if source.get("ratio") is None else str(source["ratio"]) + "%"
                 source_notes.append(f"股权查询：{source.get('company', '')}（{source.get('company_id', '')}） / {source.get('relation_type', '')} / {source.get('counterparty', '')} / {ratio_text}")
         append_row(roster, [name, origin, reason, record.get("depth", ""), record.get("parent_name", ""),
-            "\n".join(record.get("paths", [])), "存在数据缺口" if name in incomplete else "已取得本次核查资料", outcome,
+            "\n".join(record.get("paths", [])), "存在资料缺口" if name in incomplete else "已取得本次核查资料", outcome,
             company.legal_person if company else "", company.found_date if company else "", company.capital if company else None,
             company.insured if company else None, "\n".join(source_notes + record.get("notes", []))])
 
-    summary_ws = create_sheet(wb, "关系核查汇总",
-        ["公司对编号", "公司A", "公司B", "与审计对象的关系", "风险初判", "主要线索摘要", "命中类别", "证据条数", "查看全部证据", "建议审计程序", "资料限制", "人工复核意见", "复核人 / 日期", "序号"],
-        [20, 28, 28, 33, 12, 48, 30, 12, 22, 45, 30, 40, 24, 10])
+    summary_ws = create_sheet(wb, "疑似关联方复核底稿",
+        ["线索编号", "公司名称", "风险等级", "与被审计单位的疑似关系", "发现了什么", "证据条数", "查看全部证据", "建议审计程序", "资料限制", "人工复核意见", "复核人 / 日期", "序号"],
+        [16, 30, 12, 34, 48, 12, 20, 45, 28, 40, 24, 10])
     summary_rows = {}
     for index, item in enumerate(summary, 1):
         key = pair_key(item["company_a"], item["company_b"])
-        # GX- 编号保留作链接锚点；末尾"对-XX"序号供底稿引用和口头沟通。
-        row = append_row(summary_ws, [pair_id(*key), item["company_a"], item["company_b"], item["relation_type"],
-            risk_text(item["max_level"]), clue_summary(item),
-            item["dimensions"], item["hit_count"], "查看全部证据", item["suggestion"],
-            "存在数据缺口，详见缺口页" if set(key) & incomplete else "", "", "", f"对-{index:02d}"])
+        # GX- 编号保留作链接锚点；末尾序号供底稿引用和口头沟通。
+        row = append_row(summary_ws, [pair_id(*key), item["company"], risk_text(item["max_level"]),
+            item["relation_to_target"], clue_summary(item),
+            item["hit_count"], "查看全部证据", item["suggestion"],
+            "存在资料缺口，详见各家资料取得情况" if set(key) & incomplete else "", "", "", f"{index:02d}"])
         summary_rows[key] = row
     for row, key in overview_links:
-        keyed_link(overview.cell(row, 1), "关系核查汇总", pair_id(*key))
+        keyed_link(overview.cell(row, 1), "疑似关联方复核底稿", pair_id(*key))
 
     evidence_ws = create_sheet(wb, "证据明细",
-        ["证据编号", "公司A", "公司B", "核查类别", "风险初判", "判断依据", "来源公司", "原始字段", "原始值", "原始文件 / 工作表 / 单元格", "返回汇总", "案例参考（非本次证据）", "序号"],
+        ["证据编号", "被审计单位", "公司", "核查类别", "风险初判", "判断依据", "来源公司", "原始字段", "原始值", "原始文件 / 工作表 / 单元格", "返回底稿", "案例参考（非本次证据）", "序号"],
         [24, 27, 27, 22, 12, 55, 27, 23, 44, 48, 18, 33, 10])
     first_evidence = {}
     evidence_seq = {}
@@ -405,21 +424,24 @@ def write_report(out_path, summary, all_hits, companies, target_display,
         if evidence_id not in evidence_seq:
             # 同一证据编号的多行来源共享同一个"证-XX"序号，按首次出现顺序编号。
             evidence_seq[evidence_id] = f"证-{len(evidence_seq) + 1:02d}"
+        # 每对必有一方是被审计单位，固定放"被审计单位"列，另一方放"公司"列。
+        target_side = hit["company_a"] if hit["company_a"] in target_set else hit["company_b"]
+        other_side = hit["company_b"] if target_side == hit["company_a"] else hit["company_a"]
         sources = hit.get("sources") or [None]
         for source in sources:
             source_text = (os.path.relpath(source["file"], Path(out_path).parent) + "\n" + source["sheet"] + "!" + source["cell"]) if source else "来源位置未记录，须人工核对"
-            row = append_row(evidence_ws, [evidence_id, hit["company_a"], hit["company_b"], hit["dimension"],
+            row = append_row(evidence_ws, [evidence_id, target_side, other_side, hit["dimension"],
                 risk_text(hit["level"]), hit["evidence"], source["company"] if source else "", source["field"] if source else "",
-                source["value"] if source else "", source_text, "返回对应汇总", hit["case_ref"], evidence_seq[evidence_id]])
+                source["value"] if source else "", source_text, "返回对应底稿", hit["case_ref"], evidence_seq[evidence_id]])
             first_evidence.setdefault(key, evidence_id)
             if source:
                 source_link(evidence_ws.cell(row, 10), source, out_path)
             if key in summary_rows:
-                keyed_link(evidence_ws.cell(row, 11), "关系核查汇总", pair_id(*key))
+                keyed_link(evidence_ws.cell(row, 11), "疑似关联方复核底稿", pair_id(*key))
     for key, row in summary_rows.items():
         if key in first_evidence:
-            keyed_link(summary_ws.cell(row, 9), "证据明细", first_evidence[key])
-    gaps_ws = create_sheet(wb, "数据覆盖与缺口",
+            keyed_link(summary_ws.cell(row, 7), "证据明细", first_evidence[key])
+    gaps_ws = create_sheet(wb, "各家资料取得情况",
         ["公司 / 项目", "资料维度 / 类型", "取得或处理情况", "影响的核查", "说明", "来源文件", "取数任务创建时间"],
         [30, 25, 36, 38, 60, 48, 25])
     # 维度级汇总置顶：全部公司都未取得的维度先总起一笔，说清影响面。
@@ -487,17 +509,21 @@ def write_report(out_path, summary, all_hits, companies, target_display,
         append_row(gaps_ws, values)
     for item in errors + limitations:
         append_row(gaps_ws, [item.get("source", ""), item.get("category", ""), "需复核", "按说明确认受影响范围", item.get("message", ""), "", ""])
-    explanation = create_sheet(wb, "任务说明", ["项目", "内容"], [32, 115])
+    explanation = create_sheet(wb, "核查任务说明", ["项目", "内容"], [32, 115])
     mode_names = {"discovery": "主动发现", "list_check": "名单核查", "existing_export": "已有数据离线核查"}
     for values in [["任务模式", mode_names.get(task_mode, task_mode or "未说明")], ["被审计单位", target_display],
                    ["报告生成时间", datetime.now().astimezone().isoformat(timespec="seconds")]] + [[key, value] for key, value in scope.items()]:
         append_row(explanation, values)
-    append_row(explanation, ["阅读方法", "概览 → 关系汇总 → 证据明细 → 原始单元格。证据明细同一编号的多行是同一命中的不同来源。"])
-    append_row(explanation, ["筛选与链接", "汇总与证据之间按编号定位，排序后仍可往返。查看全部证据时，按公司A和公司B筛选；来源文件同时标明工作表和单元格。"])
+    append_row(explanation, ["阅读方法", "核查结论 → 复核底稿 → 证据明细 → 原始单元格。证据明细同一编号的多行是同一条证据的不同来源。"])
+    append_row(explanation, ["筛选与链接", "底稿与证据之间按编号定位，排序后仍可往返。查看全部证据时，按公司列筛选；来源文件同时标明工作表和单元格。"])
     append_row(explanation, ["原始资料", "报告与原始资料目录应一起移动。链接使用相对路径；若客户端只打开文件，按同时显示的工作表和单元格定位。"])
     append_row(explanation, ["日期口径", "核查基准日用于计算成立时间等规则；原始记录日期见对应原表字段。取数任务创建时间不等同于记录生效日期。"])
+    # 标签页顺序与目录一致：核查结论 → 复核底稿 → 证据明细 → 其余参考表。
+    wb._sheets = [wb[title] for title in SHEETS]
     for ws in wb.worksheets:
-        finish_sheet(ws, 5 if ws.title in {"关系核查汇总", "证据明细"} else None)
+        finish_sheet(ws, {"疑似关联方复核底稿": 3, "证据明细": 5}.get(ws.title))
+    if clue_header_row:
+        restyle_section_headers(overview, [clue_header_row])
     group_evidence_blocks(evidence_ws)
     for row, title in enumerate(list(SHEETS)[1:], 4):
         put(wb["目录"], row, 3, max(0, wb[title].max_row - 3))

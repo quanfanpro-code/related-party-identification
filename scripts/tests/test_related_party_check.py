@@ -216,7 +216,8 @@ class RunCheckIntegrationTests(unittest.TestCase):
         summary = [{
             "company_a": "乙公司",
             "company_b": "甲公司",
-            "relation_type": "审计对象-交易对手",
+            "company": "乙公司",
+            "relation_to_target": "存在持股或被持股关系",
             "is_related": "是（建议确认）",
             "max_level": "🔴硬关联",
             "dimensions": "股权控制穿透",
@@ -235,12 +236,12 @@ class RunCheckIntegrationTests(unittest.TestCase):
 
         workbook = openpyxl.load_workbook(output_path)
         try:
-            sheet = workbook["关系核查汇总"]
-            self.assertEqual(sheet["B3"].value, "公司A")
+            sheet = workbook["疑似关联方复核底稿"]
+            self.assertEqual(sheet["B3"].value, "公司名称")
             self.assertEqual(sheet["B3"].fill.fgColor.rgb, "001F4E79")
             self.assertEqual(sheet["A3"].font.color.rgb, "00FFFFFF")
             self.assertEqual(sheet["B4"].value, "乙公司")
-            self.assertEqual(sheet["E4"].fill.fgColor.rgb, "00FCE4D6")
+            self.assertEqual(sheet["C4"].fill.fgColor.rgb, "00FCE4D6")
             self.assertEqual(sheet.freeze_panes, "C4")
         finally:
             workbook.close()
@@ -269,10 +270,10 @@ class RunCheckIntegrationTests(unittest.TestCase):
         )
         workbook = openpyxl.load_workbook(output_path, read_only=True)
         try:
-            self.assertIn("数据覆盖与缺口", workbook.sheetnames)
-            self.assertIn("任务说明", workbook.sheetnames)
+            self.assertIn("各家资料取得情况", workbook.sheetnames)
+            self.assertIn("核查任务说明", workbook.sheetnames)
             self.assertTrue(any("主要人员（高管）.xlsx" in str(row) and "读取失败" in str(row)
-                                for row in workbook["数据覆盖与缺口"].values))
+                                for row in workbook["各家资料取得情况"].values))
         finally:
             workbook.close()
 

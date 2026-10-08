@@ -120,9 +120,9 @@ class ReportAcceptanceTests(unittest.TestCase):
         self.assertEqual(len(reports), 1)
         wb = openpyxl.load_workbook(reports[0])
         try:
-            rows = list(wb["关系核查汇总"].values)
-            self.assertTrue(any("甲公司" in row and "乙公司" in row for row in rows))
-            self.assertTrue(any("公开供应商关系" in str(row) for row in wb["核查对象与来源"].values))
+            rows = list(wb["疑似关联方复核底稿"].values)
+            self.assertTrue(any("乙公司" in str(row) for row in rows))
+            self.assertTrue(any("公开供应商关系" in str(row) for row in wb["纳入核查的公司名单"].values))
         finally:
             wb.close()
         self.assertEqual(result.status, "completed")
@@ -155,19 +155,19 @@ class ReportAcceptanceTests(unittest.TestCase):
             finally:
                 wb.close()
 
-    def test_七表导航统计和缺口不混淆(self):
+    def test_八表导航统计和缺口不混淆(self):
         write_basic(self.root, ["甲公司", "乙公司"], shared_phone=False)
         result = self.run_silent(data_dir=self.root, target_names=["甲公司"], output_path=self.root / "报告.xlsx")
         wb = openpyxl.load_workbook(result.output_path)
         try:
-            self.assertEqual(wb.sheetnames, ["目录", "核查概览", "核查对象与来源", "关系核查汇总", "证据明细", "数据覆盖与缺口", "任务说明"])
+            self.assertEqual(wb.sheetnames, ["目录", "核查结论", "疑似关联方复核底稿", "证据明细", "纳入核查的公司名单", "各家资料取得情况", "核查范围与数量说明", "核查任务说明"])
             for ws in wb.worksheets[1:]:
                 self.assertIsNotNone(ws["A1"].hyperlink)
-            overview = {row[0]: row[1] for row in wb["核查概览"].iter_rows(min_row=4, values_only=True) if row[0]}
-            self.assertEqual(overview["实际尝试比对公司对数"], 1)
-            self.assertEqual(overview["命中公司对数"], 0)
-            self.assertGreater(overview["存在数据缺口公司数"], 0)
-            for name in ("核查对象与来源", "关系核查汇总", "证据明细", "数据覆盖与缺口"):
+            quality = {row[0]: row[1] for row in wb["核查范围与数量说明"].iter_rows(min_row=4, values_only=True) if row[0]}
+            self.assertEqual(quality["与被审计单位实际比对的次数"], 1)
+            self.assertEqual(quality["发现疑似关联方"], 0)
+            self.assertGreater(quality["存在资料缺口的公司数"], 0)
+            for name in ("纳入核查的公司名单", "疑似关联方复核底稿", "证据明细", "各家资料取得情况"):
                 self.assertTrue(wb[name].auto_filter.ref)
                 self.assertTrue(wb[name].freeze_panes)
         finally:
@@ -211,7 +211,7 @@ class ReportAcceptanceTests(unittest.TestCase):
             "dimension_results": {"S0000041": "no_data"}}, ensure_ascii=False), encoding="utf-8")
         result = self.run_silent(data_dir=self.root, target_names=["甲公司"], output_path=self.root / "报告.xlsx")
         wb = openpyxl.load_workbook(result.output_path)
-        rows = list(wb["数据覆盖与缺口"].values)
+        rows = list(wb["各家资料取得情况"].values)
         # 全体公司都是"明确无数据"的维度折叠成一条（统计表确认无数据），与静默缺失区分开；
         # 静默缺失（未取得）是缺口，仍逐家列出。
         folded = [row for row in rows if row[:3] == ("全部核查对象", "商标", "明确无数据")]
@@ -227,22 +227,23 @@ class ReportAcceptanceTests(unittest.TestCase):
             result = self.run_silent(data_dir=self.root, target_names=["甲公司"], output_path=self.root / "报告.xlsx")
         self.assertTrue(any("模拟规则异常" in item["message"] for item in result.errors))
         wb = openpyxl.load_workbook(result.output_path)
-        self.assertTrue(any("规则执行失败" in str(row) for row in wb["核查对象与来源"].values))
+        self.assertTrue(any("规则执行失败" in str(row) for row in wb["纳入核查的公司名单"].values))
         wb.close()
 
-    def test_非审计对象之间命中不推定与审计对象关联(self):
+    def test_与被审计单位无关的公司之间不再比对(self):
         write_basic(self.root, ["甲公司", "乙公司", "丙公司"], shared_phone=False)
         write_dimension(self.root, "商标.xlsx", [[1, "乙公司", "共用品牌"], [2, "丙公司", "共用品牌"]])
         result = self.run_silent(data_dir=self.root, target_names=["甲公司"], output_path=self.root / "报告.xlsx")
-        self.assertEqual(len(result.summary), 1)
-        self.assertIn("不推定", result.summary[0]["relation_type"])
+        # 乙丙互相撞商标，但哪家都跟被审计单位没关系：回答不了"是不是关联方"，不比也不报。
+        self.assertEqual(result.hits, [])
+        self.assertEqual(result.summary, [])
 
     def test_失去基础资料的候选仍出现在对象名单(self):
         write_basic(self.root, ["甲公司"])
         result = self.run_silent(data_dir=self.root, target_names=["甲公司"], output_path=self.root / "报告.xlsx",
             object_records=[{"name": "乙公司", "relation_type": "公开客户关系", "reasons": ["公开客户关系"]}])
         wb = openpyxl.load_workbook(result.output_path)
-        rows = [row for row in wb["核查对象与来源"].values if row[0] == "乙公司"]
+        rows = [row for row in wb["纳入核查的公司名单"].values if row[0] == "乙公司"]
         self.assertEqual(len(rows), 1)
         self.assertIn("未纳入比对", rows[0][7])
         self.assertEqual(result.hits, [])
@@ -269,7 +270,7 @@ class ReportAcceptanceTests(unittest.TestCase):
         result = self.run_silent(data_dir=self.root, target_names=["甲公司"], output_path=self.root / "报告.xlsx")
         wb = openpyxl.load_workbook(result.output_path)
         try:
-            location = wb["关系核查汇总"]["I4"].hyperlink.location
+            location = wb["疑似关联方复核底稿"]["G4"].hyperlink.location
             self.assertIn(location, wb.defined_names)
             self.assertIn("MATCH(", wb.defined_names[location].attr_text)
             back = wb["证据明细"]["K4"].hyperlink.location

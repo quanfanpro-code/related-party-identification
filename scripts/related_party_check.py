@@ -874,7 +874,7 @@ def rule6_historical(ca: Company, cb: Company):
     return hits
 
 
-def equity_path_hits(companies):
+def equity_path_hits(companies, target_set):
     """在已取得资料内寻找最多五层的多数持股路径，不传递少数股权。曾用名归一到现名建边。"""
     alias = {}
     for name, company in companies.items():
@@ -912,6 +912,9 @@ def equity_path_hits(companies):
         paths[root] = found
     hits = []
     for a, b in combinations(sorted(companies), 2):
+        # 与主比对同一口径：只保留被审计单位↔各公司的对子。
+        if (a in target_set) == (b in target_set):
+            continue
         chains = []
         if b in paths.get(a, {}) and len(paths[a][b][1]) > 1:
             chains = [paths[a][b]]
@@ -1098,8 +1101,37 @@ def level_rank(level):
     return {HARD: 3, MEDIUM: 2, LOW: 1}.get(level, 0)
 
 
+# 命中类别 → 报告里"与被审计单位的疑似关系"一列直接写给读者看的白话。
+# 比对只发生在被审计单位与每一家公司之间，所以每类命中都能说成一种疑似关系。
+DIMENSION_PHRASES = {
+    "股权控制穿透": "存在持股或被持股关系",
+    "关键人员重合": "关键人员与被审计单位重合",
+    "历史关联痕迹": "与被审计单位有历史股权或人员痕迹",
+    "担保资金链": "与被审计单位存在资产抵质押等资金往来",
+    "无形资产共用": "与被审计单位使用相同品牌或无形资产",
+    "客商异常画像": "是被审计单位的客户或供应商，且自身特征异常",
+    "工商指纹重合": "注册地址、电话或邮箱与被审计单位相同",
+}
+# 个别命中按具体内容给更准的说法，覆盖上面的类别级表述。
+FIELD_PHRASES = {
+    "dual_role": "既是被审计单位的客户又是其供应商",
+    "equity_path": "通过多层持股与被审计单位形成控制路径",
+    "phone_segment": "座机号段与被审计单位相邻",
+}
+
+
+def relation_phrases(hits):
+    """把一家公司的全部命中翻成"与被审计单位的疑似关系"，风险高的说法排前面。"""
+    phrases = {}
+    for h in hits:
+        phrase = FIELD_PHRASES.get(h["field"]) or DIMENSION_PHRASES.get(h["dimension"], h["dimension"])
+        phrases[phrase] = max(phrases.get(phrase, 0), level_rank(h["level"]))
+    ranked = sorted(phrases.items(), key=lambda pair: (-pair[1], pair[0]))
+    return "；".join(phrase for phrase, _rank in ranked)
+
+
 def aggregate(all_hits, target_set):
-    """按公司对汇总。返回 [{pair, levels, dimensions, max_level, is_related, ...}]。target_set 为审计对象群。"""
+    """按公司汇总命中。比对只含被审计单位↔各公司，故每个 pair 必有一方是被审计单位。"""
     by_pair = defaultdict(list)
     for h in all_hits:
         pair = tuple(sorted([h["company_a"], h["company_b"]]))
@@ -1130,18 +1162,14 @@ def aggregate(all_hits, target_set):
             is_related = "低风险线索，待核实"
             suggestion = "记录备查，必要时跟进"
         ca, cb = pair
-        ca_t, cb_t = ca in target_set, cb in target_set
-        if ca_t and cb_t:
-            relation = "审计对象之间"
-        elif ca_t or cb_t:
-            relation = "审计对象与核查对象"
-        else:
-            relation = "其他核查对象之间（不推定与审计对象关联）"
+        # 比对只保留被审计单位↔各公司，pair 里必有一方是被审计单位，另一方就是要报告的公司。
+        company = next((name for name in pair if name not in target_set), cb)
         # 全部命中都来自 ≥5 家共用指纹（疑似集中注册/代理记账）的公司对：审计价值低，
         # 收敛处理——概览折叠为一行、汇总排在后段；命中本身保留，等级与证据不变。
         converged = all(SHARED_FINGERPRINT_NOTE.search(h["evidence"]) for h in hits)
         summary.append({
-            "company_a": ca, "company_b": cb, "relation_type": relation,
+            "company_a": ca, "company_b": cb, "company": company,
+            "relation_to_target": relation_phrases(hits),
             "is_related": is_related, "max_level": max_level,
             "hit_count": len(hits), "dimensions": "、".join(dims),
             "evidence": ("多条独立线索相互印证；" if corroborated else "") + " | ".join(sorted({h["evidence"] for h in hits})),
@@ -1155,9 +1183,8 @@ def aggregate(all_hits, target_set):
             "case_ref": "、".join(sorted({h["case_ref"] for h in hits})),
             "hits": hits,
         })
-    # 先按是否涉及被审计单位分组（审计师第一诉求），再排除已收敛对，组内按风险与命中条数排。
+    # 收敛对排在后段，其余按风险与命中条数排。
     summary.sort(key=lambda x: (
-        0 if (x["company_a"] in target_set or x["company_b"] in target_set) else 1,
         1 if x["converged"] else 0,
         -level_rank(x["max_level"]), -x["hit_count"]))
     return summary
@@ -1299,8 +1326,12 @@ def run_check(
     counterparties = counterparty_names if counterparty_rows else None
 
     all_hits = []
-    names = sorted(companies)
-    for company_a, company_b in combinations(names, 2):
+    # 只比"被审计单位 ↔ 每一家公司"。两家都与被审计单位无关的公司之间即使互相撞上，
+    # 也回答不了"是不是/有哪些关联方"，属于本技能用途之外的内容，不比也不报。
+    target_names_in_data = sorted(target_set & set(companies))
+    other_names = sorted(set(companies) - target_set)
+    compared_pairs = [(a, b) for a in target_names_in_data for b in other_names]
+    for company_a, company_b in compared_pairs:
         all_hits.extend(
             compare_pair(
                 companies[company_a],
@@ -1313,7 +1344,7 @@ def run_check(
                 counterparties=counterparties,
             )
         )
-    all_hits.extend(equity_path_hits(companies))
+    all_hits.extend(equity_path_hits(companies, target_set))
     # 同一事实重复命中只保留一条；编号不依赖明细的显示行号。
     identified = {}
     for hit in all_hits:
@@ -1331,9 +1362,9 @@ def run_check(
         "是否提供用户自报名单": "是" if disclosed_parties is not None else "否",
     }
     scope.update(scope_metadata or {})
-    scope["实际尝试比对公司对数"] = len(companies) * (len(companies) - 1) // 2
+    scope["被审计单位与各公司的实际比对数"] = len(compared_pairs)
     scope["原始资料目录"] = "\n".join(os.path.relpath(path, output.parent) for path in data_paths)
-    scope["自动结论含义"] = "仅为线索初判；未命中不代表不存在关联关系；其他核查对象之间的命中不推定与被审计单位关联"
+    scope["本次核查结论（必读）"] = "本报告只是自动初判线索，不是审计结论：列出的疑似关联方需经审计程序核实；未发现不代表不存在关联关系，关联方是否完整须结合其他审计程序确认"
     scope["规则范围"] = "工商资料七类线索筛查；同名需核验身份。多数持股路径最多五层，每段均超过50%才自动串联；不把少数股权或共同合营关系直接传递为控制。"
     scope["需要补充的业务资料"] = "亲属关系、表决权与一致行动协议、集团联营合营安排、交易实质及管理层披露，需要结合相应资料人工核实。"
     records = list(object_records or [])
