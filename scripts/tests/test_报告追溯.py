@@ -205,14 +205,19 @@ class ReportAcceptanceTests(unittest.TestCase):
         result = self.run_silent(data_dir=self.root, target_names=["甲公司"], output_path=self.root / "报告.xlsx")
         self.assertEqual(result.hits, [])
 
-    def test_明确无数据与静默缺失分别显示(self):
+    def test_明确无数据折叠显示与静默缺失逐家显示(self):
         write_basic(self.root, ["甲公司", "乙公司"], shared_phone=False)
         (self.root / "取数说明.json").write_text(json.dumps({"company_names": ["甲公司", "乙公司"],
             "dimension_results": {"S0000041": "no_data"}}, ensure_ascii=False), encoding="utf-8")
         result = self.run_silent(data_dir=self.root, target_names=["甲公司"], output_path=self.root / "报告.xlsx")
         wb = openpyxl.load_workbook(result.output_path)
         rows = list(wb["数据覆盖与缺口"].values)
-        self.assertTrue(any(row[:3] == ("甲公司", "商标", "明确无数据") for row in rows))
+        # 全体公司都是"明确无数据"的维度折叠成一条（统计表确认无数据），与静默缺失区分开；
+        # 静默缺失（未取得）是缺口，仍逐家列出。
+        folded = [row for row in rows if row[:3] == ("全部核查对象", "商标", "明确无数据")]
+        self.assertEqual(len(folded), 1)
+        self.assertIn("2 家", folded[0][4])
+        self.assertFalse(any(row[1] == "商标" and row[0] == "甲公司" for row in rows))
         self.assertTrue(any(row[:3] == ("甲公司", "软件著作权", "未取得") for row in rows))
         wb.close()
 

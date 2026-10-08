@@ -258,6 +258,38 @@ class Test缺口页汇总与排序(unittest.TestCase):
             yi_basic = next(row for row in rows if row[0] == "乙测试有限公司" and row[1] == "基础工商信息")
             self.assertIn("涉及命中", yi_basic[4])
 
+    def test_全体未见记录的维度折叠为一条(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_xlsx(d, "基础工商信息.xlsx", BASIC_HEADER,
+                       [basic_row("甲测试有限公司", 1), basic_row("乙测试有限公司", 2)])
+            write_xlsx(d, "动产抵押.xlsx", ["序号", "公司名称", "c", "d", "抵押人", "抵押权人"], [])
+            (Path(d) / "取数说明.json").write_text(json.dumps({
+                "company_names": ["甲测试有限公司", "乙测试有限公司"],
+                "dimension_results": {code: "completed" for code in DIMENSION_NAMES},
+            }, ensure_ascii=False), encoding="utf-8")
+            result = run(d)
+            rows = gap_rows(result.output_path)
+            per_company = [row for row in rows if row[1] == "动产抵押" and row[0] not in {"全部核查对象", "其余核查对象"}]
+            self.assertEqual(per_company, [], "全体未见记录的维度不该再逐家列：{}".format(per_company))
+            folded = [row for row in rows if row[0] == "全部核查对象" and row[1] == "动产抵押"]
+            self.assertEqual(len(folded), 1, "折叠行应只有一条")
+            self.assertEqual(folded[0][2], "已核对范围，未见记录")
+            self.assertIn("2 家", folded[0][4])
+
+    def test_个别未见记录不折叠(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_xlsx(d, "基础工商信息.xlsx", BASIC_HEADER,
+                       [basic_row("甲测试有限公司", 1), basic_row("乙测试有限公司", 2)])
+            write_xlsx(d, "商标.xlsx", ["序号", "公司名称", "商标名"], [[1, "甲测试有限公司", "某商标"]])
+            (Path(d) / "取数说明.json").write_text(json.dumps({
+                "company_names": ["甲测试有限公司", "乙测试有限公司"],
+                "dimension_results": {code: "completed" for code in DIMENSION_NAMES},
+            }, ensure_ascii=False), encoding="utf-8")
+            result = run(d)
+            rows = gap_rows(result.output_path)
+            self.assertTrue(any(row[0] == "乙测试有限公司" and row[1] == "商标" for row in rows),
+                            "有公司取得记录的维度应按公司保留明细")
+
 
 class Test缺口计数分两档(unittest.TestCase):
     def test_重度与轻度缺口公司分开统计(self):
@@ -291,6 +323,53 @@ class Test对手方画像措辞(unittest.TestCase):
                             "画像线索应点明讲的是对手方自身特征：" + hits[0]["evidence"])
             self.assertIn("乙测试有限公司", hits[0]["evidence"])
             self.assertIn("真实交易", hits[0]["evidence"])
+
+    def test_中关村等含村的正常地名不判居民楼(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_xlsx(d, "基础工商信息.xlsx", BASIC_HEADER,
+                       [basic_row("甲测试有限公司", 1),
+                        basic_row("乙测试有限公司", 2, address="北京市海淀区中关村大街27号")])
+            result = run(d)
+            hits = [h for h in result.hits if h["field"] == "profile"]
+            self.assertEqual(hits, [], "中关村这类正常地名不应判居民楼")
+
+    def test_村组门牌仍判居民楼(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_xlsx(d, "基础工商信息.xlsx", BASIC_HEADER,
+                       [basic_row("甲测试有限公司", 1),
+                        basic_row("乙测试有限公司", 2, address="四川省某县某镇幸福村3组12号")])
+            result = run(d)
+            hits = [h for h in result.hits if h["field"] == "profile"]
+            self.assertTrue(hits, "村组门牌应仍判居民楼")
+            self.assertIn("居民楼", hits[0]["evidence"])
+
+
+class Test客商画像只对真实客商(unittest.TestCase):
+    CUST_HEADER = ["序号", "公司名称", "c", "d", "e", "f", "g", "关联方名称"]
+    SHELL = {"capital": "10万", "insured": "0"}
+
+    def test_有客户表时未出现在客户表的公司不做画像(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_xlsx(d, "基础工商信息.xlsx", BASIC_HEADER,
+                       [basic_row("甲测试有限公司", 1),
+                        basic_row("乙测试有限公司", 2, **self.SHELL),
+                        basic_row("丙测试有限公司", 3, **self.SHELL)])
+            write_xlsx(d, "客户.xlsx", self.CUST_HEADER, [[1, "甲测试有限公司", "", "", "", "", "", "丙测试有限公司"]])
+            result = run(d)
+            pairs = {frozenset({h["company_a"], h["company_b"]}) for h in result.hits if h["field"] == "profile"}
+            self.assertNotIn(frozenset({"甲测试有限公司", "乙测试有限公司"}), pairs,
+                             "乙公司不在客户表里，不该被当成客商做画像")
+            self.assertIn(frozenset({"甲测试有限公司", "丙测试有限公司"}), pairs,
+                          "丙公司是真实客商，应保留画像")
+
+    def test_导出里没有任何客商数据时保持画像(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_xlsx(d, "基础工商信息.xlsx", BASIC_HEADER,
+                       [basic_row("甲测试有限公司", 1),
+                        basic_row("乙测试有限公司", 2, **self.SHELL)])
+            result = run(d)
+            hits = [h for h in result.hits if h["field"] == "profile"]
+            self.assertTrue(hits, "没有客商资料时仍应画像，避免静默丢掉线索")
 
 
 class Test摘要按整条证据截断(unittest.TestCase):

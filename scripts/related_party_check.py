@@ -85,6 +85,9 @@ PUBLIC_EMAIL_DOMAINS = {
     "188.com", "2980.com", "263.net", "mail.com", "yahoo.com", "live.com",
     "icloud.com", "me.com", "msn.com",
 }
+# 居民楼特征只认"小区/花园/公寓/苑"和带门牌的"×村N组/N号"，
+# 裸"村"会把中关村、亚运村这类正常地名误判成居民楼。
+RESIDENTIAL_ADDRESS = re.compile(r"小区|花园|公寓|苑|村\s*\d+\s*(?:组|队|排|栋|幢|号)")
 
 # 维度文件名（容错：缺文件跳过）
 FILES = {
@@ -681,11 +684,13 @@ def months_since_found(found_date, as_of_date):
     return months
 
 
-def rule3_counterparty_profile(ca: Company, cb: Company, target_set, as_of_date=None):
+def rule3_counterparty_profile(ca: Company, cb: Company, target_set, as_of_date=None, counterparties=None):
     """维度3: 客商异常画像（对非审计对象群的公司做单方向画像）。
 
     审计对象群 = 被审计单位 + 其重要子公司（--target 逗号分隔）。
     只对「审计对象 ↔ 对手方」做画像；双方都是/都不是审计对象则跳过。
+    counterparties 传入审计对象群已知的交易对手方名称时，只有确实出现在客商名单里的公司才做画像；
+    传 None 表示本次没有客商资料，维持原行为，避免静默丢掉线索。
     """
     hits = []
     ca_is_target = ca.name in target_set
@@ -696,6 +701,10 @@ def rule3_counterparty_profile(ca: Company, cb: Company, target_set, as_of_date=
         party = ca
     else:
         return hits  # 同属审计对象群（集团内）或都是外部对手方，不做画像
+    if counterparties is not None:
+        party_names = {normalize_name(n) for n in {party.name} | set(party.former_names)}
+        if not party_names & counterparties:
+            return hits  # 名单里没有这家，不是客商，谈不上交易真实性画像
     flags = []
     as_of = as_of_date or date.today()
     age_months = months_since_found(party.found_date, as_of)
@@ -712,10 +721,10 @@ def rule3_counterparty_profile(ca: Company, cb: Company, target_set, as_of_date=
         flags.append("参保人数0(空壳特征)")
     elif party.insured is not None and party.insured < 5:
         flags.append(f"参保人数{party.insured}(疑似空壳)")
-    # 地址居民楼
+    # 地址居民楼（认"×村N组/N号"这类门牌，不认中关村、亚运村等正常地名）
     for a in party.addresses:
-        if any(k in a for k in ["小区", "花园", "公寓", "苑", "村", "组"]):
-            flags.append(f"注册地址疑似居民楼")
+        if RESIDENTIAL_ADDRESS.search(a):
+            flags.append("注册地址疑似居民楼")
             break
     # 缺失经营范围列为数据缺口，不构造风险命中。
     if party.business_scope and len(party.business_scope) < 10:
@@ -932,7 +941,7 @@ def rule9_dual_role(ca, cb, dim):
     return hits
 
 
-def compare_pair(ca, cb, dim, target_set, as_of_date=None, errors=None, scarcity=None):
+def compare_pair(ca, cb, dim, target_set, as_of_date=None, errors=None, scarcity=None, counterparties=None):
     """对一对公司跑全部规则，返回 [hit_dict...]。target_set 为审计对象群（含子公司）。"""
     results = []
     # rule3 需要方向参数、rule1 需要全样本稀缺性计数、rule9 需要客户/供应商明细，均单独调用；其余规则统一双参数
@@ -969,6 +978,7 @@ def compare_pair(ca, cb, dim, target_set, as_of_date=None, errors=None, scarcity
             cb,
             target_set,
             as_of_date=as_of_date,
+            counterparties=counterparties,
         ):
             results.append({
                 "company_a": ca.name, "company_b": cb.name,
@@ -1211,6 +1221,19 @@ def run_check(
         for addr in {normalize_address(a) for a in all_addresses(company)} - {""}:
             scarcity["address"][addr] += 1
 
+    # 客商名单：有客商资料时，画像只对真的出现在名单里的对手方做，
+    # 否则同一份导出里的任何公司都会被配成"客商"出现在重点线索里。
+    counterparty_names = set()
+    counterparty_rows = 0
+    for key in ("customer", "supplier"):
+        for target in target_set:
+            for row in dim.get(key, {}).get(target, []):
+                counterparty_rows += 1
+                value = strip_html(str(row_value(row, 7, "") or ""))
+                if value:
+                    counterparty_names.add(normalize_name(value))
+    counterparties = counterparty_names if counterparty_rows else None
+
     all_hits = []
     names = sorted(companies)
     for company_a, company_b in combinations(names, 2):
@@ -1223,6 +1246,7 @@ def run_check(
                 as_of_date=check_date,
                 errors=errors,
                 scarcity=scarcity,
+                counterparties=counterparties,
             )
         )
     all_hits.extend(equity_path_hits(companies))

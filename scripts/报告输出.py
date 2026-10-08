@@ -409,12 +409,28 @@ def write_report(out_path, summary, all_hits, companies, dim, target_display, da
         append_row(gaps_ws, ["全部核查对象", "维度级汇总",
             f"本次未取得维度：{'、'.join(all_missing)}，影响全部 {len(names)} 家", impacts,
             "相关核查规则整体受限" + ("；逐公司重复行已折叠，不再逐家列出" if degraded_mode else "；逐公司明细见下文"), "", ""])
+    # 走完流程的公司若在某维度上"已核对、未见记录"或"明确无数据"，那不是缺口；
+    # 两条以上就折叠成一条，缺口（未取得、读取失败、范围待核实）永远逐家列出。
+    quiet_statuses = {"已核对范围，未见记录", "明确无数据"}
+    checked_names = set(companies)
+    by_label = {}
+    for record in coverage:
+        by_label.setdefault(record[1], []).append(record)
+    quiet = {}
+    for label, records in by_label.items():
+        quiet_rows = [record for record in records
+                      if record[0] in checked_names and record[2] in quiet_statuses]
+        statuses = {record[2] for record in quiet_rows}
+        if len(quiet_rows) >= 2 and len(statuses) == 1:
+            quiet[label] = (len(quiet_rows), next(iter(statuses)), len(records) - len(quiet_rows))
     # 涉及命中公司的缺口行排在前面并标记，读者先看到削弱结论的缺口。
     ok_status = {"已取得记录", "明确无数据", "已核对范围，未见记录"}
     candidate_keys = {"customer", "supplier", "abnormal"}
     front, rest = [], []
     for record in coverage:
         if degraded_mode and record[1] in all_missing:
+            continue
+        if record[1] in quiet and record[0] in checked_names and record[2] in quiet_statuses:
             continue
         values = list(record)
         is_gap = record[2] not in ok_status and label_key.get(record[1]) not in candidate_keys
@@ -423,6 +439,12 @@ def write_report(out_path, summary, all_hits, companies, dim, target_display, da
             front.append(values)
         else:
             rest.append(values)
+    for label, (count, status, others) in quiet.items():
+        note = "；其余公司单独列于本表前面各行" if others else ""
+        rest.append(["全部核查对象" if not others else "其余核查对象", label,
+            status, DIMENSIONS[label_key[label]][1],
+            (f"该维度 {count} 家已核对，未见记录" if status == "已核对范围，未见记录"
+             else f"该维度 {count} 家经统计表确认无数据") + note, "", ""])
     for values in front + rest:
         if values[5]:
             values[5] = os.path.relpath(values[5], Path(out_path).parent)
