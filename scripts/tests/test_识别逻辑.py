@@ -116,6 +116,38 @@ class IdentificationLogicTests(unittest.TestCase):
                 self.assertTrue(hits)
                 self.assertTrue(all(hit[1] == MEDIUM for hit in hits))
 
+    def test_一方缺区号尾段一致只作为待核实线索(self):
+        # 工商登记常见写法差异：一方带区号、一方只写本地号，不能整条漏掉
+        hits = rule1_fingerprint(Company("甲", phones={"02888881234"}), Company("乙", phones={"88881234"}))
+        self.assertTrue(hits, "一方缺区号时尾段一致应列待核实线索")
+        self.assertTrue(all(hit[1] == MEDIUM for hit in hits))
+        self.assertTrue(any("缺区号" in hit[2] for hit in hits))
+        reverse = rule1_fingerprint(Company("甲", phones={"88881234"}), Company("乙", phones={"02888881234"}))
+        self.assertTrue(reverse, "方向反过来同样应命中")
+
+    def test_手机号尾八位不与本地号互判缺区号(self):
+        # 手机号尾 8 位与本地座机同形，参与尾段比对会大量误报
+        self.assertEqual(rule1_fingerprint(Company("甲", phones={"13888881234"}), Company("乙", phones={"88881234"})), [])
+
+    def test_低比例持股单独出现降为轻微_伴随其他红旗保留中级(self):
+        from scripts.related_party_check import LOW
+        alone = compare_pair(Company("甲公司", investments=[("乙公司", "1%")]), Company("乙公司"), {}, set())
+        invest_alone = [hit for hit in alone if hit["field"] == "invest"]
+        self.assertTrue(invest_alone)
+        self.assertTrue(all(hit["level"] == LOW for hit in invest_alone), "1% 持股单独出现应降为轻微")
+        flagged = compare_pair(
+            Company("甲公司", investments=[("乙公司", "1%")], main_persons=[("陈甲", "董事")]),
+            Company("乙公司", main_persons=[("陈甲", "监事")]), {}, set())
+        invest_flagged = [hit for hit in flagged if hit["field"] == "invest"]
+        self.assertTrue(invest_flagged)
+        self.assertTrue(all(hit["level"] == MEDIUM for hit in invest_flagged), "伴随人员重合红旗时应保留中级")
+
+    def test_比例未知的持股不按低比例降级(self):
+        hits = compare_pair(Company("甲公司", investments=[("乙公司", "待核实")]), Company("乙公司"), {}, set())
+        invest = [hit for hit in hits if hit["field"] == "invest"]
+        self.assertTrue(invest)
+        self.assertTrue(all(hit["level"] == MEDIUM for hit in invest), "未知比例不当作低比例处理")
+
     def test_地址不能丢失城市或六位门牌(self):
         for first, second in (("成都市中山路100号A座101室", "北京市中山路100号A座102室"),
                               ("成都市大道123456号", "成都市大道654321号")):

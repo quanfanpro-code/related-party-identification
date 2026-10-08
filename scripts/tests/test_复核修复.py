@@ -205,5 +205,90 @@ class Test曾用名股权(unittest.TestCase):
             self.assertTrue(hits, "曾用名未接通股权线")
 
 
+class Test复核优化20261008(unittest.TestCase):
+    """2026-10-08 独立复核（逻辑与报告可读性）发现修复的行为测试：
+    概览按是否涉及被审计单位排序、高共用度指纹收敛、取数范围外不计缺口。"""
+
+    def overview_rows(self, path):
+        wb = openpyxl.load_workbook(path)
+        try:
+            return [row for row in wb["核查概览"].iter_rows(min_row=4, values_only=True) if row[0]]
+        finally:
+            wb.close()
+
+    def test_概览涉及被审计单位的线索排在其他对象之间前面(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_xlsx(d, "基础工商信息.xlsx", BASIC_HEADER, [
+                basic_row("甲测试有限公司", 1),
+                basic_row("乙测试有限公司", 2, phone="13911112222"),
+                basic_row("丙测试有限公司", 3, phone="13911112222"),
+            ])
+            write_xlsx(d, "商标.xlsx", TRADEMARK_HEADER,
+                       [[1, "甲测试有限公司", "共同牌"], [2, "乙测试有限公司", "共同牌"]])
+            result = run(d)
+            clues = [row for row in self.overview_rows(result.output_path) if "↔" in str(row[0])]
+            self.assertEqual(len(clues), 2)
+            self.assertIn("甲测试有限公司", clues[0][0],
+                          "涉及被审计单位的中风险线索应排在其他对象之间的高风险线索前面")
+            self.assertNotIn("甲测试有限公司", clues[1][0])
+            # 汇总表同样按该顺序排列
+            wb = openpyxl.load_workbook(result.output_path)
+            try:
+                rows = [row for row in wb["关系核查汇总"].iter_rows(min_row=4, values_only=True) if row[0]]
+            finally:
+                wb.close()
+            self.assertIn("甲测试有限公司", rows[0][1] + rows[0][2])
+
+    def test_全部命中来自高共用度指纹的公司对收敛(self):
+        with tempfile.TemporaryDirectory() as d:
+            rows = [basic_row(f"共用地址测试{i}有限公司", i, address="北京市海淀区中关村大街27号")
+                    for i in range(1, 7)]
+            write_xlsx(d, "基础工商信息.xlsx", BASIC_HEADER, rows)
+            result = run(d, target="共用地址测试1有限公司")
+            self.assertEqual(len(result.summary), 15, "6 家两两 15 对，命中保留不丢")
+            self.assertTrue(all(item["converged"] for item in result.summary))
+            self.assertTrue(all(hit["level"] == MEDIUM for hit in result.hits), "收敛不改命中本身的等级")
+            overview = self.overview_rows(result.output_path)
+            clues = [row for row in overview if "↔" in str(row[0])]
+            self.assertEqual(clues, [], "收敛对不逐对列入重点线索")
+            folded = [row for row in overview if str(row[0]).startswith("高共用度指纹收敛")]
+            self.assertEqual(len(folded), 1)
+            self.assertIn("15", folded[0][0])
+            metrics = {row[0]: row[1] for row in overview}
+            self.assertEqual(metrics.get("其中高共用度指纹收敛公司对数"), 15)
+            wb = openpyxl.load_workbook(result.output_path)
+            try:
+                summary_rows = [row for row in wb["关系核查汇总"].iter_rows(min_row=4, values_only=True) if row[0]]
+            finally:
+                wb.close()
+            self.assertEqual(len(summary_rows), 15)
+            self.assertTrue(all(str(row[5]).startswith("【收敛") for row in summary_rows),
+                            "汇总摘要应带收敛标记")
+
+    def test_取数范围外不计入缺口_范围内未取得计入(self):
+        from scripts.related_party_check import Company
+        from scripts.报告输出 import DIMENSIONS, OUT_OF_SCOPE_STATUS, coverage_rows
+        filled = {"legal_person": "某人", "phones": {"13900000000"}, "emails": ["a@corp.com"],
+                  "addresses": ["某市某路1号"], "capital": 1000000.0, "found_date": "2010-01-01",
+                  "insured": 10, "business_scope": "软件开发以及信息技术咨询服务"}
+        companies = {"甲": Company("甲", **filled), "乙": Company("乙", **filled)}
+        # 除商标维度外，其余维度两家公司均有记录，把缺口来源隔离到商标一处。
+        file_info = [
+            {"key": key, "file": f"{key}.xlsx", "exists": True, "readable": True,
+             "companies": ["甲", "乙"], "scope": ["甲"], "terminal": "completed",
+             "created_at": "", "malformed": False}
+            for key in DIMENSIONS
+        ]
+        next(item for item in file_info if item["key"] == "trademark").update(
+            {"companies": [], "terminal": ""})
+        rows, incomplete, _severe = coverage_rows(["甲", "乙"], companies, file_info, [], {"甲"})
+        yi_tm = next(row for row in rows if row[0] == "乙" and row[1] == "商标")
+        self.assertEqual(yi_tm[2], OUT_OF_SCOPE_STATUS, "乙不在取数范围内，该维度应记为范围外")
+        self.assertNotIn("乙", incomplete, "范围外不计入缺口")
+        jia_tm = next(row for row in rows if row[0] == "甲" and row[1] == "商标")
+        self.assertEqual(jia_tm[2], "未见该企业记录，范围待核实", "被审计单位在范围内，未取得应记为真缺口")
+        self.assertIn("甲", incomplete)
+
+
 if __name__ == "__main__":
     unittest.main()

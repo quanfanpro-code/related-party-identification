@@ -95,7 +95,7 @@ class Test概览结论先行(unittest.TestCase):
     def test_取数通道降级提示紧跟自动结论含义(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "报告.xlsx"
-            write_report(out, [], [], {}, {}, "甲测试有限公司", {},
+            write_report(out, [], [], {}, "甲测试有限公司",
                          limitations=[{"category": "取数通道降级", "source": "批量导出",
                                        "message": "批量通道连续失败，已改用逐家取数补采"}])
             names = overview_names(out)
@@ -222,7 +222,7 @@ class Test缺口页汇总与排序(unittest.TestCase):
     def test_保底模式下全体未取得维度只保留一条顶部汇总(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "报告.xlsx"
-            write_report(out, [], [], {}, {}, "甲公司 / 乙公司", {},
+            write_report(out, [], [], {}, "甲公司 / 乙公司",
                          limitations=[{"category": "取数通道降级", "source": "批量导出",
                                        "message": "批量通道连续失败，已改用逐家取数补采"}])
             rows = gap_rows(out)
@@ -235,7 +235,7 @@ class Test缺口页汇总与排序(unittest.TestCase):
     def test_非保底模式保留逐家明细且顶部仍有维度汇总(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "报告.xlsx"
-            write_report(out, [], [], {}, {}, "甲公司 / 乙公司", {})
+            write_report(out, [], [], {}, "甲公司 / 乙公司")
             rows = gap_rows(out)
             self.assertEqual(rows[0][1], "维度级汇总")
             self.assertTrue(any(row[:3] == ("甲公司", "商标", "未取得") for row in rows),

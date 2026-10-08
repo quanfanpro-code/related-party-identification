@@ -28,6 +28,8 @@ LIGHT = "F3F7FB"
 RISK_COLORS = {"高": "FCE4D6", "中": "FFF2CC", "低": "E2F0D9"}
 # 概览与汇总的"主要线索摘要"长度上限：按整条证据取舍，不切断单条证据。
 SUMMARY_LIMIT = 240
+# "取数范围外"状态：导出本就不覆盖该公司该维度，属正常情况，不计入数据缺口。
+OUT_OF_SCOPE_STATUS = "本次取数范围外，导出未覆盖该企业"
 DIMENSIONS = {
     "basic": ("基础工商信息", "工商指纹、人员、客商画像、历史痕迹"),
     "shareholder": ("股东信息", "人员、共同股东"),
@@ -206,10 +208,14 @@ def clue_summary(item, limit=SUMMARY_LIMIT):
     joined = " | ".join(kept)
     if omitted:
         joined += f"…（另 {omitted} 条见明细）"
-    return ("多条独立线索相互印证；" if item.get("corroborated") else "") + joined
+    prefix = "多条独立线索相互印证；" if item.get("corroborated") else ""
+    if item.get("converged"):
+        prefix += "【收敛：全部命中来自高共用度指纹，疑似集中注册或代理记账】"
+    return prefix + joined
 
 
-def coverage_rows(names, companies, file_info, errors):
+def coverage_rows(names, companies, file_info, errors, target_set=None):
+    target_set = set(target_set or ())
     rows = []
     incomplete = set()
     gap_dimensions = Counter()
@@ -229,7 +235,13 @@ def coverage_rows(names, companies, file_info, errors):
             elif any(item["readable"] and item["terminal"] == "completed" and name in item["scope"] for item in own):
                 status = "已核对范围，未见记录"
             elif any(item["readable"] for item in infos):
-                status = "未见该企业记录，范围待核实"
+                # 维度文件存在但该公司没有记录：按取数范围区分两类——
+                # 范围内（取数说明列名或被审计单位）应取得而未取得，属真缺口；
+                # 范围外（导出本就不覆盖该公司该维度，如名单里的客户供应商）属正常，不计缺口。
+                if name in target_set or any(name in item["scope"] for item in infos):
+                    status = "未见该企业记录，范围待核实"
+                else:
+                    status = OUT_OF_SCOPE_STATUS
             else:
                 status = "未取得"
             detail = ""
@@ -242,7 +254,7 @@ def coverage_rows(names, companies, file_info, errors):
                 if blanks:
                     status = "已取得记录，部分字段缺失或不可用"
                     detail = "缺失或不能按本次口径解析的字段：" + "、".join(blanks)
-            if status not in {"已取得记录", "明确无数据", "已核对范围，未见记录"} and key not in {"customer", "supplier", "abnormal"}:
+            if status not in {"已取得记录", "明确无数据", "已核对范围，未见记录", OUT_OF_SCOPE_STATUS} and key not in {"customer", "supplier", "abnormal"}:
                 incomplete.add(name)
                 gap_dimensions[name] += 1
             chosen = record or next(iter(own or infos), {})
@@ -256,7 +268,7 @@ def coverage_rows(names, companies, file_info, errors):
     return rows, incomplete, severe
 
 
-def write_report(out_path, summary, all_hits, companies, dim, target_display, data_completeness,
+def write_report(out_path, summary, all_hits, companies, target_display,
                  *, errors=None, limitations=None, task_mode="", scope_metadata=None,
                  file_info=None, object_records=None, target_set=None):
     errors, limitations = list(errors or []), list(limitations or [])
@@ -274,7 +286,7 @@ def write_report(out_path, summary, all_hits, companies, dim, target_display, da
             objects[name]["sources"] = objects[name].get("sources", []) + record.get("sources", [])
     names = sorted(set(companies) | target_set | set(objects) | {name for info in file_info for name in info["scope"]}
                    | {name for info in file_info if info["key"] == "basic" for name in info["companies"]})
-    coverage, incomplete, severe = coverage_rows(names, companies, file_info, errors)
+    coverage, incomplete, severe = coverage_rows(names, companies, file_info, errors, target_set)
     counts = Counter(risk_text(item["max_level"]) for item in summary)
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -300,13 +312,22 @@ def write_report(out_path, summary, all_hits, companies, dim, target_display, da
     if not counts["高"] and not counts["中"]:
         append_row(overview, ["重要提示", "本结果不提供关联方完整性保证", "",
             "零命中或全部为低风险线索；未命中不代表不存在关联关系，关联方完整性须结合其他审计程序确认"])
-    append_row(overview, ["重点线索", "点击公司对进入汇总", "与审计对象的关系", "下列按风险排序；完整原文见证据明细"])
+    append_row(overview, ["重点线索", "点击公司对进入汇总", "与审计对象的关系",
+        "涉及被审计单位的线索排在前面，组内按风险排序；完整原文见证据明细"])
     overview_links = []
+    converged_items = [item for item in summary if item.get("converged")]
     for item in summary:
+        if item.get("converged"):
+            continue  # 高共用度指纹收敛对不逐对列入重点线索，折叠为一行说明
         row = append_row(overview, [f"{item['company_a']} ↔ {item['company_b']}", risk_text(item["max_level"]) + "风险线索",
                                    item["relation_type"],
                                    clue_summary(item)])
         overview_links.append((row, pair_key(item["company_a"], item["company_b"])))
+    if converged_items:
+        append_row(overview, [f"高共用度指纹收敛（{len(converged_items)} 对公司对）",
+            "全部命中来自 5 家及以上共用的地址/电话/邮箱，疑似集中注册或代理记账",
+            "",
+            "审计价值低，不逐对列入重点线索；逐对明细见关系核查汇总后段及证据明细"])
     if not summary:
         append_row(overview, ["本次未形成命中", "请结合数据缺口阅读", "", "只说明实际取得资料中的规则结果"])
     append_row(overview, ["范围与口径指标", "以下为范围、进度与统计口径注解", "", ""])
@@ -318,6 +339,11 @@ def write_report(out_path, summary, all_hits, companies, dim, target_display, da
         ["实际尝试比对公司对数", scope.get("实际尝试比对公司对数", len(companies) * (len(companies) - 1) // 2), "", "两家公司组成一对，任一规则失败另列数据缺口"],
         ["命中公司对数", len(summary), "", "同一公司对命中多条证据，只计一对"],
         ["证据条数", len({hit.get("evidence_id", str(i)) for i, hit in enumerate(all_hits)}), "", "按证据编号去重；明细的多个来源行不重复计数"],
+    ]
+    if converged_items:
+        metrics.append(["其中高共用度指纹收敛公司对数", len(converged_items), "",
+            "全部命中来自 5 家及以上共用指纹，疑似集中注册或代理记账，已列于汇总后段"])
+    metrics += [
         ["存在数据缺口公司数", len(incomplete), "", "缺资料、空字段或规则失败；具体影响见数据覆盖与缺口"],
         ["其中重度缺口公司数", len(severe), "", "未取得基础工商记录，或缺失维度达 10 个及以上；缺口实质削弱核查结论"],
         ["其中轻度缺口公司数", len(incomplete - severe), "", "其余存在缺口的公司；个别维度或字段缺失，影响相对有限"],
@@ -423,8 +449,12 @@ def write_report(out_path, summary, all_hits, companies, dim, target_display, da
         statuses = {record[2] for record in quiet_rows}
         if len(quiet_rows) >= 2 and len(statuses) == 1:
             quiet[label] = (len(quiet_rows), next(iter(statuses)), len(records) - len(quiet_rows))
-    # 涉及命中公司的缺口行排在前面并标记，读者先看到削弱结论的缺口。
-    ok_status = {"已取得记录", "明确无数据", "已核对范围，未见记录"}
+    # "取数范围外"不是缺口：同一维度两家及以上时折叠为一行说明，个别出现的保留单行。
+    out_scope = {label: len([record for record in records if record[2] == OUT_OF_SCOPE_STATUS])
+                 for label, records in by_label.items()}
+    out_scope = {label: count for label, count in out_scope.items() if count >= 2}
+    # 涉及命中公司的缺口行排在前面并标记，读者先看到需要结合结论阅读的缺口。
+    ok_status = {"已取得记录", "明确无数据", "已核对范围，未见记录", OUT_OF_SCOPE_STATUS}
     candidate_keys = {"customer", "supplier", "abnormal"}
     front, rest = [], []
     for record in coverage:
@@ -432,13 +462,19 @@ def write_report(out_path, summary, all_hits, companies, dim, target_display, da
             continue
         if record[1] in quiet and record[0] in checked_names and record[2] in quiet_statuses:
             continue
+        if record[1] in out_scope and record[2] == OUT_OF_SCOPE_STATUS:
+            continue
         values = list(record)
         is_gap = record[2] not in ok_status and label_key.get(record[1]) not in candidate_keys
         if record[0] in involved and is_gap:
-            values[4] = ("涉及命中；" + values[4]) if values[4] else "涉及命中，缺口直接削弱命中线索的强度"
+            values[4] = ("涉及命中；" + values[4]) if values[4] else \
+                "涉及命中；本行缺口指该公司在本维度的自身记录未取得，已形成的命中来自对方登记或其他维度，两者不必然互相削弱"
             front.append(values)
         else:
             rest.append(values)
+    for label, count in out_scope.items():
+        rest.append(["取数范围外公司", label, OUT_OF_SCOPE_STATUS, DIMENSIONS[label_key[label]][1],
+            f"该维度 {count} 家不在本次取数范围内（导出本就不覆盖），属正常情况，不计入数据缺口", "", ""])
     for label, (count, status, others) in quiet.items():
         note = "；其余公司单独列于本表前面各行" if others else ""
         rest.append(["全部核查对象" if not others else "其余核查对象", label,

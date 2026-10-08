@@ -230,9 +230,7 @@ class RunCheckIntegrationTests(unittest.TestCase):
             summary,
             [],
             {},
-            {},
             "甲公司",
-            {},
         )
 
         workbook = openpyxl.load_workbook(output_path)

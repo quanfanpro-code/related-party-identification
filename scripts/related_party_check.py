@@ -123,6 +123,13 @@ HARD = "🔴硬关联"      # high
 MEDIUM = "🟡可疑红旗"   # medium
 LOW = "🟢轻微异常"      # low
 
+# rule1 对 ≥5 家共用指纹的降级注记（"该电话/地址/邮箱/域名为N家共用"）。
+# 汇总层据此识别"全部命中都来自高共用度指纹"的公司对并收敛，修改注记措辞时必须同步修改本正则。
+SHARED_FINGERPRINT_NOTE = re.compile(r"该(?:电话|地址|邮箱|域名)为\d+家共用")
+
+# 投资关系候选阈值：披露比例均不低于该值才列高优先级；全部低于该值且没有其他红旗时降为轻微。
+EQUITY_RATIO_THRESHOLD = 20
+
 # ============================================================
 # 数据加载（容错：文件缺失/空文件返回空表）
 # ============================================================
@@ -310,6 +317,28 @@ def phone_segment_adjacent(phones_a, phones_b):
             if pa.startswith("0") and pb.startswith("0") and len(pa) >= 10 and len(pb) >= 10:
                 if pa[:-1] == pb[:-1] and abs(int(pa) - int(pb)) == 1:
                     return (pa, pb)
+    return None
+
+
+def phone_suffix_match(phones_a, phones_b):
+    """一方登记完整座机（含区号）、另一方只写 7-8 位本地号，且本地号是完整号码的尾段。
+
+    工商登记里"一方带区号、一方不带"是常见写法差异，只列待核实线索，不判相同。
+    完整号码必须是以 0 开头的座机：手机号尾 8 位与本地号同形，不参与尾段比对，避免误报。
+    返回 (完整号码, 本地号, 完整号码是否属于甲方) 或 None。
+    """
+    completes_a = {p for p in phones_a if p.startswith("0") and len(p) >= 10}
+    locals_a = {p for p in phones_a if not p.startswith("0") and 7 <= len(p) <= 8}
+    completes_b = {p for p in phones_b if p.startswith("0") and len(p) >= 10}
+    locals_b = {p for p in phones_b if not p.startswith("0") and 7 <= len(p) <= 8}
+    for full in sorted(completes_a):
+        for local in sorted(locals_b):
+            if full.endswith(local):
+                return (full, local, True)
+    for full in sorted(completes_b):
+        for local in sorted(locals_a):
+            if full.endswith(local):
+                return (full, local, False)
     return None
 
 
@@ -588,11 +617,25 @@ def rule1_fingerprint(ca: Company, cb: Company, scarcity=None):
         hits.append(("phone", level, f"联系电话相同: {','.join(sorted(common_phones))}" + suffix, "蓝山/卓朗/达志科技案",
                      trace(ca, "phone", common_phones, normalize=normalize_phones) + trace(cb, "phone", common_phones, normalize=normalize_phones)))
     else:
-        # 电话号段相邻（座机同一区号+局向，末位不同 → 同一办公地点的连续号码）
-        seg = phone_segment_adjacent(ca.phones, cb.phones)
-        if seg:
-            hits.append(("phone_segment", MEDIUM, f"座机号段相邻: {seg[0]}↔{seg[1]}（待核实，不能据此认定同一地点）", "蓝山科技案(号段相邻)",
-                         trace(ca, "phone", [seg[0]], normalize=normalize_phones) + trace(cb, "phone", [seg[1]], normalize=normalize_phones)))
+        # 一方带区号、一方只写本地号：尾段一致列待核实线索（工商登记常见写法差异）
+        suffix = phone_suffix_match(ca.phones, cb.phones)
+        if suffix:
+            full, local, full_from_a = suffix
+            shared = phone_count.get(local, 0)
+            notes = ["一方缺区号，地域待核实"]
+            if shared >= 5:
+                notes.append(f"该电话为{shared}家共用，疑似代理记账或集中注册")
+            if full_from_a:
+                sources = trace(ca, "phone", [full], normalize=normalize_phones) + trace(cb, "phone", [local], normalize=normalize_phones)
+            else:
+                sources = trace(ca, "phone", [local], normalize=normalize_phones) + trace(cb, "phone", [full], normalize=normalize_phones)
+            hits.append(("phone", MEDIUM, f"联系电话尾段一致: {full}↔{local}（{'；'.join(notes)}）", "蓝山/卓朗/达志科技案", sources))
+        else:
+            # 电话号段相邻（座机同一区号+局向，末位不同 → 同一办公地点的连续号码）
+            seg = phone_segment_adjacent(ca.phones, cb.phones)
+            if seg:
+                hits.append(("phone_segment", MEDIUM, f"座机号段相邻: {seg[0]}↔{seg[1]}（待核实，不能据此认定同一地点）", "蓝山科技案(号段相邻)",
+                             trace(ca, "phone", [seg[0]], normalize=normalize_phones) + trace(cb, "phone", [seg[1]], normalize=normalize_phones)))
     # 邮箱完全相同（同一邮箱被 5 家及以上共用时同样视为代理记账特征）
     common_emails = set(ca.emails) & set(cb.emails)
     if common_emails:
@@ -625,7 +668,7 @@ def rule1_fingerprint(ca: Company, cb: Company, scarcity=None):
                     else:
                         level = HARD
                 case = "天沃科技案(同楼同座)" if kind != "exact" else "达志科技案(地址相同)"
-                hits.append(("address", level, f"{desc}；甲方地址：{a1}；乙方地址：{a2}", case,
+                hits.append(("address", level, f"{desc}；{ca.name}地址：{a1}；{cb.name}地址：{a2}", case,
                              trace(ca, "address", [a1], normalize=strip_html) + trace(cb, "address", [a2], normalize=strip_html)))
                 break
     # 网址同域名
@@ -758,7 +801,7 @@ def rule5_equity(ca: Company, cb: Company):
         ratios += [ratio for name, ratio, _ in child.shareholders if normalize_name(name) in parent_names]
         if ratios:
             parsed = [parse_percentage(ratio) for ratio in ratios]
-            level = HARD if all(ratio is not None and ratio >= 20 for ratio in parsed) else MEDIUM
+            level = HARD if all(ratio is not None and ratio >= EQUITY_RATIO_THRESHOLD for ratio in parsed) else MEDIUM
             hits.append(("invest", level, f"{parent.name} 对 {child.name} 的持股线索；记录比例：{'、'.join(sorted(set(str(r) or '未披露' for r in ratios)))}（控制或重大影响待核实）", "投资关系",
                 trace(parent, "invest", invest_names, normalize=normalize_name) + trace(child, "shareholder", sh_names, normalize=normalize_name)
                 + trace(parent, "names", [parent.name], normalize=normalize_name) + trace(child, "names", [child.name], normalize=normalize_name)))
@@ -769,6 +812,21 @@ def rule5_equity(ca: Company, cb: Company):
             f"共同股东同名: {','.join(sorted(common_sh))}（结合持股比例及其他安排核实影响）", "股权穿透",
             trace(ca, "shareholder", common_sh, normalize=normalize_name) + trace(cb, "shareholder", common_sh, normalize=normalize_name)))
     return hits
+
+
+def low_ratio_only(ca: Company, cb: Company):
+    """双向已披露持股比例全部低于候选阈值时返回 True。
+
+    只按已披露比例判断：比例未知（None）不当作低比例，不据此降级。
+    """
+    ratios = []
+    for parent, child in ((ca, cb), (cb, ca)):
+        child_names = {normalize_name(n) for n in ({child.name} | set(child.former_names))}
+        parent_names = {normalize_name(n) for n in ({parent.name} | set(parent.former_names))}
+        ratios += [parse_percentage(ratio) for name, ratio in parent.investments + parent.holdings if normalize_name(name) in child_names]
+        ratios += [parse_percentage(ratio) for name, ratio, _ in child.shareholders if normalize_name(name) in parent_names]
+    known = [ratio for ratio in ratios if ratio is not None]
+    return bool(known) and all(ratio < EQUITY_RATIO_THRESHOLD for ratio in known)
 
 
 def rule6_historical(ca: Company, cb: Company):
@@ -1025,6 +1083,14 @@ def compare_pair(ca, cb, dim, target_set, as_of_date=None, errors=None, scarcity
                 "source": "既客又供",
                 "message": f"{ca.name}↔{cb.name}: {e}",
             })
+    # 低比例持股按文档口径收紧：已披露比例全部低于候选阈值的投资线索，
+    # 只有同时命中共同关键人员等其他中/高红旗时才保留中级；单独出现降为轻微。
+    other_flags = [h for h in results if h["field"] != "invest" and level_rank(h["level"]) >= level_rank(MEDIUM)]
+    if not other_flags and low_ratio_only(ca, cb):
+        for h in results:
+            if h["field"] == "invest" and h["level"] == MEDIUM:
+                h["level"] = LOW
+                h["evidence"] += "；已披露比例均低于20%，单独出现降为轻微（与共同关键人员等其他红旗同时出现时保留为可疑）"
     return results
 
 
@@ -1071,6 +1137,9 @@ def aggregate(all_hits, target_set):
             relation = "审计对象与核查对象"
         else:
             relation = "其他核查对象之间（不推定与审计对象关联）"
+        # 全部命中都来自 ≥5 家共用指纹（疑似集中注册/代理记账）的公司对：审计价值低，
+        # 收敛处理——概览折叠为一行、汇总排在后段；命中本身保留，等级与证据不变。
+        converged = all(SHARED_FINGERPRINT_NOTE.search(h["evidence"]) for h in hits)
         summary.append({
             "company_a": ca, "company_b": cb, "relation_type": relation,
             "is_related": is_related, "max_level": max_level,
@@ -1081,11 +1150,16 @@ def aggregate(all_hits, target_set):
                 {h["evidence"]: level_rank(h["level"]) for h in hits}.items(),
                 key=lambda pair: (-pair[1], len(pair[0]), pair[0]))],
             "corroborated": corroborated,
+            "converged": converged,
             "suggestion": suggestion,
             "case_ref": "、".join(sorted({h["case_ref"] for h in hits})),
             "hits": hits,
         })
-    summary.sort(key=lambda x: (-level_rank(x["max_level"]), -x["hit_count"]))
+    # 先按是否涉及被审计单位分组（审计师第一诉求），再排除已收敛对，组内按风险与命中条数排。
+    summary.sort(key=lambda x: (
+        0 if (x["company_a"] in target_set or x["company_b"] in target_set) else 1,
+        1 if x["converged"] else 0,
+        -level_rank(x["max_level"]), -x["hit_count"]))
     return summary
 
 
@@ -1186,7 +1260,6 @@ def run_check(
 
     target_display = " / ".join(sorted(target_set))
     companies = {}
-    data_completeness = {}
     for name in company_names:
         basic_rows = dim.get("basic", {}).get(name, [])
         basic_row = basic_rows[0] if basic_rows else None
@@ -1199,15 +1272,6 @@ def run_check(
         if company.found_date and len(company.found_date) == 10 and date.fromisoformat(company.found_date) > check_date:
             errors.append({"category": "数据字段异常", "source": name, "message": "成立日期晚于核查基准日，不能用于成立年限风险判断"})
         companies[name] = company
-        filled = sum([
-            bool(company.legal_person),
-            bool(company.phones),
-            bool(company.emails),
-            bool(company.addresses),
-            company.capital is not None,
-            company.insured is not None,
-        ])
-        data_completeness[name] = f"{filled}/6"
 
     # 全样本指纹稀缺性计数：同一指纹被多家公司共用时降级（代理记账/集中注册特征）
     scarcity = {"phone": Counter(), "email": Counter(), "address": Counter(), "email_domain": Counter()}
@@ -1311,9 +1375,7 @@ def run_check(
         summary,
         all_hits,
         companies,
-        dim,
         target_display,
-        data_completeness,
         errors=errors,
         limitations=limitations,
         task_mode=task_mode,
