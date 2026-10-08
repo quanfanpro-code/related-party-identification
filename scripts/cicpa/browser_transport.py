@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import base64
 import json as jsonlib
+import os
 import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlencode
 
@@ -25,10 +27,38 @@ def locate_cli(which: Callable[[str], Optional[str]] = shutil.which) -> str:
     found = which("opencli")
     if not found:
         raise OpenCliBridgeError(
-            "未找到 opencli 命令。请先安装 OpenCLI 命令行工具(npm install -g opencli)"
+            "未找到 opencli 命令。请先安装 OpenCLI 命令行工具"
+            "(npm install -g @jackwener/opencli)"
             "并在 Edge 中启用 OpenCLI 扩展,这是一次性动作。"
         )
     return found
+
+
+def build_cli_command(cli_path: str) -> List[str]:
+    """构造调用 opencli 的命令前缀。
+
+    Windows 下 npm 生成的是 .cmd 批处理包装,参数需先经命令解释器解析:
+    请求地址里的 & 会被当成命令分隔符,超长参数(例如把整份企业名单文件
+    编码后塞进同一个参数)会被截断。两种情况下页面收到的 JS 都不完整,
+    表现为 SyntaxError: missing ) after argument list。
+    因此遇到 .cmd/.bat 包装时,改为用 node 直接执行其入口脚本,绕开命令
+    解释器;    条件不满足时保持原命令不变。可用环境变量 RPI_OPENCLI_NODE 指定
+    node 可执行文件位置,未指定时按 PATH 查找。
+    """
+    if os.name == "nt" and cli_path.lower().endswith((".cmd", ".bat")):
+        entry = (
+            Path(cli_path).resolve().parent
+            / "node_modules"
+            / "@jackwener"
+            / "opencli"
+            / "dist"
+            / "src"
+            / "main.js"
+        )
+        node = os.environ.get("RPI_OPENCLI_NODE") or shutil.which("node")
+        if node and entry.is_file():
+            return [node, str(entry)]
+    return [cli_path]
 
 
 def parse_profile_list_output(text: str) -> List[str]:
@@ -119,7 +149,7 @@ class OpenCliTransport:
         return self._resolved_profile
 
     def _run(self, args: List[str], timeout: Optional[float] = None):
-        return self._runner([self.cli_path, *args], timeout=timeout)
+        return self._runner([*build_cli_command(self.cli_path), *args], timeout=timeout)
 
     def _eval(self, js: str, timeout: float = 60.0) -> str:
         result = self._run(
@@ -198,11 +228,15 @@ class OpenCliTransport:
         if files is not None:
             name, (filename, content, mime) = next(iter(files.items()))
             encoded = base64.b64encode(content).decode("ascii")
+            # 注意:占位符外面不能再加引号。下面的替换值由 json.dumps 生成,
+            # 本身就带引号;模板里若再包一层,会得到 ""file"" 这样的三重引号,
+            # 页面端报 SyntaxError: missing ) after argument list。
+            # atob 里的 __DATA__ 是原始 base64 文本,不经 json.dumps,故保留引号。
             body_js = (
                 '(()=>{const fd=new FormData();'
-                'fd.append("__NAME__",new File('
-                '[Uint8Array.from(atob("__DATA__"))],"__FILENAME__",'
-                '{type:"__MIME__"}));return fd;})()'
+                'fd.append(__NAME__,new File('
+                '[Uint8Array.from(atob("__DATA__"))],__FILENAME__,'
+                '{type:__MIME__}));return fd;})()'
             )
             body_js = (
                 body_js.replace("__NAME__", jsonlib.dumps(name))
