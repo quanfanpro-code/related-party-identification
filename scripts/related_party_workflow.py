@@ -65,9 +65,9 @@ class TaskState:
     audited_entity: str
     stage: str = "created"
     status: str = "waiting_user"
-    initial_depth: int = 2
+    initial_depth: int = 5
     maximum_depth: int = 5
-    approved_depth: int = 2
+    approved_depth: int = 5
     candidate_cap: int = 100
     input_files: List[str] = field(default_factory=list)
     output_dir: str = ""
@@ -872,7 +872,8 @@ def main(argv=None) -> int:
     run_parser.add_argument("--state-path", required=True, type=Path)
     run_parser.add_argument("--input", action="append", default=[])
     run_parser.add_argument("--output-dir", required=True)
-    run_parser.add_argument("--approved-depth", type=int, default=2)
+    run_parser.add_argument("--approved-depth", type=int, default=5,
+                            help="穿透层数，默认 5 层；超过 5 层须先在对话中向用户确认")
     run_parser.add_argument("--as-of-date", default="", help="核查基准日，格式 YYYY-MM-DD；缺省为运行当天")
     run_parser.add_argument("--candidate-cap", type=int, default=100, help="候选企业数量上限；确认超出上限后用更大的值重新运行即可继续")
     resume_parser = subparsers.add_parser("resume", help="恢复关联方识别任务")

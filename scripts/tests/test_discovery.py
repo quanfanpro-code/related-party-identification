@@ -56,7 +56,7 @@ def investment(org_id, name, ratio):
 
 
 class DiscoveryDepthTests(unittest.TestCase):
-    def test_默认先扩展两层并保留关系路径(self):
+    def test_默认穿透五层并保留关系路径(self):
         client = FakeDiscoveryClient(
             matches=[company("a", "甲公司")],
             equity={
@@ -69,10 +69,31 @@ class DiscoveryDepthTests(unittest.TestCase):
         result = discover("甲公司", client=client, policy=DiscoveryPolicy())
 
         self.assertEqual(result.status, "completed")
-        self.assertEqual(set(result.candidates), {"乙公司", "丙公司"})
-        self.assertEqual(result.candidates["丙公司"].depth, 2)
+        self.assertEqual(set(result.candidates), {"乙公司", "丙公司", "丁公司"})
+        self.assertEqual(result.candidates["丁公司"].depth, 3)
         self.assertIn("甲公司", result.candidates["乙公司"].paths[0])
-        self.assertNotIn("d", client.equity_calls)
+        self.assertIn("d", client.equity_calls)
+        self.assertFalse(result.hit_depth_limit)
+
+    def test_五层边界仍有达标主体时报告待确认(self):
+        client = FakeDiscoveryClient(
+            matches=[company("a", "甲公司")],
+            equity={
+                "a": [investment("b", "乙公司", 60.0)],
+                "b": [investment("c", "丙公司", 60.0)],
+                "c": [investment("d", "丁公司", 60.0)],
+                "d": [investment("e", "戊公司", 60.0)],
+                "e": [investment("f", "己公司", 60.0)],
+            },
+        )
+
+        result = discover("甲公司", client=client, policy=DiscoveryPolicy())
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.candidates["己公司"].depth, 5)
+        self.assertTrue(result.hit_depth_limit)
+        self.assertIn("己公司", result.frontier_names)
+        self.assertTrue(any("5 层穿透边界" in warning for warning in result.warnings))
 
     def test_用户确认后可继续到第五层(self):
         client = FakeDiscoveryClient(

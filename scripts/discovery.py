@@ -20,7 +20,7 @@ from scripts.cicpa.client import CompanyMatch, EquityEdge
 @dataclass(frozen=True)
 class DiscoveryPolicy:
     equity_threshold: float = 20.0
-    initial_depth: int = 2
+    initial_depth: int = 5
     maximum_depth: int = 5
     candidate_cap: int = 100
 
@@ -75,6 +75,8 @@ class DiscoveryResult:
     explored_depth: int = 0
     message_zh: str = ""
     warnings: List[str] = field(default_factory=list)
+    hit_depth_limit: bool = False
+    frontier_names: List[str] = field(default_factory=list)
 
 
 def _company_key(company_id: str, name: str) -> str:
@@ -113,8 +115,9 @@ def discover(
     if not name:
         raise ValueError("被审计单位名称不能为空")
     depth_limit = policy.initial_depth if approved_depth is None else approved_depth
-    if depth_limit < 1 or depth_limit > policy.maximum_depth:
-        raise ValueError("批准的穿透层数超出允许范围")
+    # ponytail: 超过 maximum_depth 不再硬拦截，靠 SKILL.md 的对话确认点把关（用户明确要求后由 AI 传更大 approved_depth）
+    if depth_limit < 1:
+        raise ValueError("批准的穿透层数无效")
 
     matches = client.search_companies(name)
     exact = [match for match in matches if match.name == name]
@@ -178,10 +181,16 @@ def discover(
     seed_people = _person_names(client, seed.org_id, result.warnings)
     visited = {_company_key(seed.org_id, seed.name)}
     queue = deque([(seed, 0, [seed.name])])
+    hit_depth_limit = False
+    frontier_names: List[str] = []
 
     while queue and result.status == "completed":
         parent, parent_depth, parent_path = queue.popleft()
         if parent_depth >= depth_limit:
+            # 队列里的节点都是达标（≥阈值）才入队的：到边界仍未展开，说明没穿透到底
+            hit_depth_limit = True
+            if parent.name not in frontier_names:
+                frontier_names.append(parent.name)
             continue
         try:
             edges = client.get_equity_relations(parent.org_id)
@@ -253,5 +262,15 @@ def discover(
                         parent_path + [candidate_name],
                     )
                 )
+
+    if hit_depth_limit and result.status == "completed":
+        result.hit_depth_limit = True
+        result.frontier_names = frontier_names
+        result.warnings.append(
+            "已到 {} 层穿透边界，仍有 {} 家达标主体未继续穿透：{}；如需更深层数，先向用户确认".format(
+                depth_limit, len(frontier_names), "、".join(frontier_names)
+            )
+        )
+        result.message_zh = result.message_zh + "（注意：第 {} 层仍有未穿透主体，需向用户确认是否继续）".format(depth_limit)
 
     return result

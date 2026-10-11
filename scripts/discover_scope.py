@@ -24,7 +24,7 @@ from scripts.cicpa.client import CicpaClient
 from scripts.discovery import DiscoveryPolicy, discover
 
 
-def penetrate(target, threshold=20.0, max_depth=2):
+def penetrate(target, threshold=20.0, max_depth=5):
     """调用统一发现引擎并返回旧入口需要的列表结构。"""
     status = auth_status()
     if status.get("status") != "authenticated":
