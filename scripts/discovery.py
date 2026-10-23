@@ -11,8 +11,8 @@
 #"""从被审计单位出发，分层发现可核查的关联方候选。"""
 
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Callable, Dict, List, Optional
 
 from scripts.cicpa.client import CompanyMatch, EquityEdge
 
@@ -109,8 +109,13 @@ def discover(
     policy: DiscoveryPolicy = DiscoveryPolicy(),
     approved_depth: Optional[int] = None,
     seed_export_candidates: Optional[List[SeedExportCandidate]] = None,
+    resume: Optional[Dict] = None,
+    on_progress: Optional[Callable[[Dict], None]] = None,
 ) -> DiscoveryResult:
-    """执行初始两层或用户批准后的最多五层广度优先发现。"""
+    """执行初始两层或用户批准后的最多五层广度优先发现。
+
+    resume 传入上一次 on_progress 落盘的快照时，从待展开队列继续，不重新走已查过的层级。
+    """
     name = str(seed_name).strip()
     if not name:
         raise ValueError("被审计单位名称不能为空")
@@ -119,17 +124,26 @@ def discover(
     if depth_limit < 1:
         raise ValueError("批准的穿透层数无效")
 
-    matches = client.search_companies(name)
-    exact = [match for match in matches if match.name == name]
-    if len(exact) == 1:
-        seed = exact[0]
-    else:
-        return DiscoveryResult(
-            status="needs_company_confirmation",
-            seed_name=name,
-            company_matches=matches,
-            message_zh="企业名称无法唯一匹配，需要用户确认具体主体",
+    saved = resume if isinstance(resume, dict) else {}
+    saved_seed = saved.get("seed") if isinstance(saved.get("seed"), dict) else {}
+    if saved_seed.get("name") or saved_seed.get("org_id"):
+        seed = CompanyMatch(
+            org_id=str(saved_seed.get("org_id") or ""),
+            name=str(saved_seed.get("name") or name),
         )
+        matches = [seed]
+    else:
+        matches = client.search_companies(name)
+        exact = [match for match in matches if match.name == name]
+        if len(exact) == 1:
+            seed = exact[0]
+        else:
+            return DiscoveryResult(
+                status="needs_company_confirmation",
+                seed_name=name,
+                company_matches=matches,
+                message_zh="企业名称无法唯一匹配，需要用户确认具体主体",
+            )
 
     result = DiscoveryResult(
         status="completed",
@@ -138,6 +152,16 @@ def discover(
         explored_depth=depth_limit,
         message_zh="主动发现已完成",
     )
+
+    saved_candidates = saved.get("candidates") if isinstance(saved.get("candidates"), dict) else {}
+    for payload in saved_candidates.values():
+        if not isinstance(payload, dict):
+            continue
+        candidate = Candidate(**{key: value for key, value in payload.items() if key in Candidate.__dataclass_fields__})
+        result.candidates[candidate.name] = candidate
+    for warning in saved.get("warnings") or []:
+        if str(warning) not in result.warnings:
+            result.warnings.append(str(warning))
 
     def add_candidate(candidate: Candidate, reasons: List[str], notes: List[str], path: str):
         existing = result.candidates.get(candidate.name)
@@ -157,7 +181,7 @@ def discover(
         result.candidates[candidate.name] = candidate
         return candidate
 
-    for item in seed_export_candidates or []:
+    for item in ([] if saved.get("queue") else (seed_export_candidates or [])):
         candidate_name = str(item.name).strip()
         if not candidate_name or candidate_name == seed.name:
             continue
@@ -179,10 +203,44 @@ def discover(
             return result
 
     seed_people = _person_names(client, seed.org_id, result.warnings)
-    visited = {_company_key(seed.org_id, seed.name)}
-    queue = deque([(seed, 0, [seed.name])])
+    saved_queue = saved.get("queue") if isinstance(saved.get("queue"), list) else []
+    saved_visited = saved.get("visited") if isinstance(saved.get("visited"), list) else []
+    if saved_queue:
+        visited = {str(key) for key in saved_visited}
+        visited.add(_company_key(seed.org_id, seed.name))
+        queue = deque(
+            (
+                CompanyMatch(
+                    org_id=str(node.get("org_id") or ""),
+                    name=str(node.get("name") or ""),
+                ),
+                int(node.get("depth") or 0),
+                [str(part) for part in (node.get("path") or [])],
+            )
+            for node in saved_queue
+            if isinstance(node, dict) and node.get("name")
+        )
+    else:
+        visited = {_company_key(seed.org_id, seed.name)}
+        queue = deque([(seed, 0, [seed.name])])
     hit_depth_limit = False
     frontier_names: List[str] = []
+
+    def checkpoint() -> None:
+        """把待展开队列和已发现候选交给调用方落盘，供中断后按续跑处理。"""
+        if on_progress is None:
+            return
+        on_progress({
+            "seed": {"org_id": seed.org_id, "name": seed.name},
+            "visited": sorted(visited),
+            "queue": [
+                {"org_id": node.org_id, "name": node.name, "depth": depth, "path": list(path)}
+                for node, depth, path in queue
+            ],
+            "candidates": {key: asdict(value) for key, value in result.candidates.items()},
+            "warnings": list(result.warnings),
+            "explored_depth": depth_limit,
+        })
 
     while queue and result.status == "completed":
         parent, parent_depth, parent_path = queue.popleft()
@@ -262,6 +320,10 @@ def discover(
                         parent_path + [candidate_name],
                     )
                 )
+        if result.status != "completed":
+            # 触顶中断时当前主体还有未展开的关系，放回队首，续跑时接着展开才不会漏候选
+            queue.appendleft((parent, parent_depth, parent_path))
+        checkpoint()
 
     if hit_depth_limit and result.status == "completed":
         result.hit_depth_limit = True

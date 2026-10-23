@@ -88,6 +88,7 @@ class TaskState:
     degraded_reason: str = ""
     as_of_date: str = ""
     channel_warnings: List[str] = field(default_factory=list)
+    discovery_progress: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -118,6 +119,48 @@ def load_task_state(path: Path) -> TaskState:
     with open(path, "r", encoding="utf-8") as stream:
         payload = json.load(stream)
     return TaskState(**payload)
+
+
+class StateConflict(RuntimeError):
+    """同一状态文件已属于另一个任务，不能按续跑处理。"""
+
+
+def resume_or_init_state(args) -> TaskState:
+    """run 遇到已有状态文件时按续跑处理，只更新本次显式给出的参数。
+
+    此前 run 每次都会新建状态并直接落盘，确认加大候选上限重跑时会把上一次的
+    候选名单和发现进度一并覆盖；改为续跑后，run 与 resume 都不会清空已有进度。
+    """
+    state_path = Path(args.state_path)
+    if not state_path.exists():
+        return TaskState(
+            task_id=state_path.stem,
+            mode=args.mode,
+            audited_entity=args.audited_entity,
+            input_files=args.input,
+            output_dir=args.output_dir,
+            approved_depth=args.approved_depth,
+            candidate_cap=args.candidate_cap,
+            as_of_date=args.as_of_date,
+        )
+    state = load_task_state(state_path)
+    if state.mode != args.mode or state.audited_entity != args.audited_entity:
+        raise StateConflict(
+            "状态文件里已有另一个任务（{}，模式 {}），本次未做任何改动；"
+            "要继续原任务请用 resume，要另开任务请换一个状态文件路径".format(
+                state.audited_entity, state.mode
+            )
+        )
+    if args.input:
+        state.input_files = list(args.input)
+    if args.output_dir:
+        state.output_dir = args.output_dir
+    if args.as_of_date:
+        state.as_of_date = args.as_of_date
+    state.candidate_cap = max(int(args.candidate_cap), int(state.candidate_cap or 0))
+    state.approved_depth = max(int(args.approved_depth), int(state.approved_depth or 0))
+    state.maximum_depth = max(int(state.maximum_depth or 0), state.approved_depth)
+    return state
 
 
 def auth_status(*, bridge_factory=None) -> Dict[str, str]:
@@ -694,7 +737,7 @@ def run_workflow(
                 state.candidate_count = len(names) - 1
                 state.message_zh = (
                     "名单包含 {} 家候选，需用户确认后继续；"
-                    "确认后请以 --candidate-cap {} 重新运行 run 命令".format(
+                    "确认后以 resume --candidate-cap {} 继续（续跑，不重走已查层级）".format(
                         state.candidate_count, state.candidate_count
                     )
                 )
@@ -748,12 +791,20 @@ def run_workflow(
                 seed_candidates = (
                     [] if state.degraded_export else extract_seed_export_candidates(data_dir, warnings=seed_warnings)
                 )
+
+                def _save_discovery_progress(progress: Dict[str, object]) -> None:
+                    """逐个节点落盘，任务中断后按续跑继续，不重走已查过的层级。"""
+                    state.discovery_progress = dict(progress)
+                    save_task_state(state_file, state)
+
                 discovery_result = discoverer(
                     state.audited_entity, client=client,
                     policy=DiscoveryPolicy(initial_depth=state.initial_depth,
                         maximum_depth=state.maximum_depth, candidate_cap=state.candidate_cap),
                     approved_depth=state.approved_depth,
                     seed_export_candidates=seed_candidates,
+                    resume=state.discovery_progress or None,
+                    on_progress=_save_discovery_progress,
                 )
                 state.candidate_count = len(discovery_result.candidates)
                 state.candidate_records = [asdict(candidate) for candidate in discovery_result.candidates.values()]
@@ -761,6 +812,8 @@ def run_workflow(
                 state.discovery_completed = discovery_result.status == "completed"
                 state.status = discovery_result.status
                 state.message_zh = discovery_result.message_zh
+                if state.discovery_completed:
+                    state.discovery_progress = {}
                 save_task_state(state_file, state)
                 if not state.discovery_completed:
                     return WorkflowResult(state.status, state.message_zh, candidate_count=state.candidate_count)
@@ -875,9 +928,11 @@ def main(argv=None) -> int:
     run_parser.add_argument("--approved-depth", type=int, default=5,
                             help="穿透层数，默认 5 层；超过 5 层须先在对话中向用户确认")
     run_parser.add_argument("--as-of-date", default="", help="核查基准日，格式 YYYY-MM-DD；缺省为运行当天")
-    run_parser.add_argument("--candidate-cap", type=int, default=100, help="候选企业数量上限；确认超出上限后用更大的值重新运行即可继续")
+    run_parser.add_argument("--candidate-cap", type=int, default=100, help="候选企业数量上限；已有状态文件时按续跑处理，只增不减")
     resume_parser = subparsers.add_parser("resume", help="恢复关联方识别任务")
     resume_parser.add_argument("--state-path", required=True, type=Path)
+    resume_parser.add_argument("--candidate-cap", type=int, default=None, help="续跑时放宽候选上限；只增不减")
+    resume_parser.add_argument("--approved-depth", type=int, default=None, help="续跑时放宽穿透层数；只增不减")
     subparsers.add_parser("validate", help="验证 skill 分发包")
     args = parser.parse_args(argv)
 
@@ -900,16 +955,17 @@ def main(argv=None) -> int:
     elif args.command == "login-status":
         payload = read_login_status(default_status_path())
     elif args.command == "run":
-        state = TaskState(
-            task_id=args.state_path.stem,
-            mode=args.mode,
-            audited_entity=args.audited_entity,
-            input_files=args.input,
-            output_dir=args.output_dir,
-            approved_depth=args.approved_depth,
-            candidate_cap=args.candidate_cap,
-            as_of_date=args.as_of_date,
-        )
+        try:
+            state = resume_or_init_state(args)
+        except StateConflict as exc:
+            _emit({
+                "status": "state_conflict",
+                "message_zh": str(exc),
+                "report_paths": [],
+                "candidate_count": 0,
+                "rejected_inputs": [],
+            })
+            return 1
         login = (
             {"status": "authenticated"}
             if state.mode == "existing_export"
@@ -938,6 +994,11 @@ def main(argv=None) -> int:
             }
     elif args.command == "resume":
         state = load_task_state(args.state_path)
+        if args.candidate_cap:
+            state.candidate_cap = max(int(args.candidate_cap), int(state.candidate_cap or 0))
+        if args.approved_depth:
+            state.approved_depth = max(int(args.approved_depth), int(state.approved_depth or 0))
+            state.maximum_depth = max(int(state.maximum_depth or 0), state.approved_depth)
         login = (
             {"status": "authenticated"}
             if state.mode == "existing_export"

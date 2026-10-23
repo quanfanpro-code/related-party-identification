@@ -62,8 +62,26 @@ def build_cli_command(cli_path: str) -> List[str]:
 
 
 def parse_profile_list_output(text: str) -> List[str]:
+    """解析 `opencli profile list` 输出:旧版为文本行,2.0 起为 JSON。"""
+    raw = str(text)
+    stripped_all = raw.strip()
+    if stripped_all.startswith("{"):
+        try:
+            payload = jsonlib.loads(stripped_all)
+        except jsonlib.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+            profiles = []
+            for item in data.get("profiles") or []:
+                if not isinstance(item, dict) or item.get("connected") is False:
+                    continue
+                name = item.get("alias") or item.get("name") or item.get("contextId")
+                if name:
+                    profiles.append(str(name))
+            return profiles
     profiles = []
-    for line in str(text).splitlines():
+    for line in raw.splitlines():
         stripped = line.strip()
         if "— connected" in stripped or "- connected" in stripped:
             name = stripped.split("—")[0].split("- connected")[0].strip()
@@ -151,27 +169,25 @@ class OpenCliTransport:
     def _run(self, args: List[str], timeout: Optional[float] = None):
         return self._runner([*build_cli_command(self.cli_path), *args], timeout=timeout)
 
+    def _browser_args(self, *args: str) -> List[str]:
+        """opencli 2.x 用 `browser --session <名> <子命令>`,1.x 为位置参数。"""
+        return ["--profile", self.profile, "browser", "--session", self.session_name, *args]
+
     def _eval(self, js: str, timeout: float = 60.0) -> str:
-        result = self._run(
-            ["--profile", self.profile, "browser", self.session_name, "eval", js],
-            timeout=timeout,
-        )
+        result = self._run(self._browser_args("eval", js), timeout=timeout)
         if getattr(result, "returncode", 0) != 0:
             raise OSError("opencli 调用失败:{}".format(getattr(result, "stderr", "") or ""))
         return _unwrap_eval_output(result.stdout or "")
 
     def open_page(self, url: str) -> None:
-        self._run(
-            ["--profile", self.profile, "browser", self.session_name, "open", url],
-            timeout=60.0,
-        )
+        self._run(self._browser_args("open", url), timeout=60.0)
 
     def get_url(self) -> str:
         result = self._run(
-            ["--profile", self.profile, "browser", self.session_name, "get", "url"],
+            self._browser_args("get", "url"),
             timeout=30.0,
         )
-        return str(result.stdout or "").strip()
+        return str(_unwrap_cli_envelope(result.stdout or "")).strip()
 
     def _verify_js(self) -> str:
         return (
@@ -302,8 +318,26 @@ class OpenCliTransport:
         return _Response(int(payload.get("s", 0)), dict(payload.get("h") or {}), content)
 
 
-def _unwrap_eval_output(stdout: str) -> str:
+def _unwrap_cli_envelope(stdout: str):
+    """opencli 2.x 统一返回 {"ok":bool,"data":...};1.x 直接返回原文。"""
     text = stdout.strip()
+    if text.startswith("{") and '"ok"' in text[:40]:
+        try:
+            payload = jsonlib.loads(text)
+        except jsonlib.JSONDecodeError:
+            return text
+        if isinstance(payload, dict) and "ok" in payload:
+            if not payload.get("ok"):
+                error = payload.get("error") or {}
+                message = error.get("message") if isinstance(error, dict) else str(error)
+                raise OpenCliBridgeError("opencli 调用失败:" + str(message or text))
+            return payload.get("data")
+    return text
+
+
+def _unwrap_eval_output(stdout: str) -> str:
+    unwrapped = _unwrap_cli_envelope(stdout)
+    text = "" if unwrapped is None else str(unwrapped).strip()
     if not text:
         return ""
     if text.startswith('"') and text.endswith('"'):
