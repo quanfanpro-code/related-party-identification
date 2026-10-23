@@ -169,5 +169,24 @@
         "record_file": "references/SOURCES.json"
       }
     }
-  ]
+  ],
+  "last_upstream_check": {
+    "checked_at": "2026-10-15T14:18:57+08:00",
+    "sources": [
+      {
+        "component": "cicpa-company-query",
+        "repository": "https://github.com/nigo81/nigo-skills",
+        "pinned": "64682115565072d1db79a5f29615dd3fdc7f6174",
+        "latest": "64682115565072d1db79a5f29615dd3fdc7f6174",
+        "status": "current"
+      },
+      {
+        "component": "OpenCLI Browser Bridge extension",
+        "repository": "https://gitee.com/github_dep/opencli",
+        "pinned": "10baf02060bda736234c160927ccd4c9d0af82b6",
+        "latest": "10baf02060bda736234c160927ccd4c9d0af82b6",
+        "status": "current"
+      }
+    ]
+  }
 }
