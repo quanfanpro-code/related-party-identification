@@ -579,6 +579,9 @@ def _safe_output_path(folder: Path, filename: str) -> Path:
 
 def _ensure_export(state, state_path, exporter, company_names, *, state_field="export_state_path") -> Path:
     saved_path = getattr(state, state_field)
+    # ponytail: 半截任务可能只记了路径还没写出状态文件，缺文件按全新开始
+    if saved_path and not Path(saved_path).exists():
+        saved_path = None
     if saved_path:
         export_state_path = Path(saved_path)
         export_state = load_export_state(export_state_path)
