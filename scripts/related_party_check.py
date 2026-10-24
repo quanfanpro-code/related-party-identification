@@ -226,7 +226,8 @@ def build_dim_index(data_dir, errors=None, limitations=None, file_info=None, dim
         if file_info is not None and fname in codes:
             file_info.append({"key": key, "file": str(Path(path).resolve()), "exists": Path(path).is_file(),
                 "readable": ncols > 0, "companies": list(by_company), "scope": metadata.get("company_names", []),
-                "terminal": terminal, "created_at": metadata.get("created_at", ""), "malformed": malformed})
+                "terminal": terminal, "created_at": metadata.get("created_at", ""), "malformed": malformed,
+                "failed": dict(metadata.get("failed_companies") or {})})
         cnt = sum(len(v) for v in by_company.values())
         companies = len(by_company)
         if companies:

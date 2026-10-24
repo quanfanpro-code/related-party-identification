@@ -240,10 +240,20 @@ def coverage_rows(names, companies, file_info, errors, target_set=None):
             infos = [item for item in file_info if item["key"] == key]
             own = [item for item in infos if name in item["companies"] or name in item["scope"]]
             record = next((item for item in own if name in item["companies"]), None)
+            failed_reason = next(
+                (item["failed"][name] for item in own or infos
+                 if name in (item.get("failed") or {})),
+                "",
+            )
+            detail = ""
             if any(item.get("malformed") for item in own or infos):
                 status = "资料字段不足"
             elif record:
                 status = "已取得记录"
+            elif failed_reason:
+                # 尝试过但没取到：如实标"取数失败"，不是"取数范围外、属正常"
+                status = "取数失败"
+                detail = failed_reason
             elif any(item["exists"] and not item["readable"] for item in own or infos):
                 status = "读取失败"
             elif any(item["terminal"] == "no_data" and name in item["scope"] for item in own):
@@ -260,7 +270,6 @@ def coverage_rows(names, companies, file_info, errors, target_set=None):
                     status = OUT_OF_SCOPE_STATUS
             else:
                 status = "未取得"
-            detail = ""
             if key == "basic" and name in companies:
                 company = companies[name]
                 fields = {"法定代表人": company.legal_person, "联系电话": company.phones,
@@ -475,6 +484,10 @@ def write_report(out_path, summary, all_hits, companies, target_display,
     out_scope = {label: len([record for record in records if record[2] == OUT_OF_SCOPE_STATUS])
                  for label, records in by_label.items()}
     out_scope = {label: count for label, count in out_scope.items() if count >= 2}
+    # "取数失败"是缺口但百行重复无信息量：同一维度两家及以上折叠为一行，个别保留单行。
+    failed_fold = {label: [record for record in records if record[2] == "取数失败"]
+                   for label, records in by_label.items()}
+    failed_fold = {label: rows_ for label, rows_ in failed_fold.items() if len(rows_) >= 2}
     # 涉及命中公司的缺口行排在前面并标记，读者先看到需要结合结论阅读的缺口。
     ok_status = {"已取得记录", "明确无数据", "已核对范围，未见记录", OUT_OF_SCOPE_STATUS}
     candidate_keys = {"customer", "supplier", "abnormal"}
@@ -485,6 +498,8 @@ def write_report(out_path, summary, all_hits, companies, target_display,
         if record[1] in quiet and record[0] in checked_names and record[2] in quiet_statuses:
             continue
         if record[1] in out_scope and record[2] == OUT_OF_SCOPE_STATUS:
+            continue
+        if record[1] in failed_fold and record[2] == "取数失败":
             continue
         values = list(record)
         is_gap = record[2] not in ok_status and label_key.get(record[1]) not in candidate_keys
@@ -497,6 +512,11 @@ def write_report(out_path, summary, all_hits, companies, target_display,
     for label, count in out_scope.items():
         rest.append(["取数范围外公司", label, OUT_OF_SCOPE_STATUS, DIMENSIONS[label_key[label]][1],
             f"该维度 {count} 家不在本次取数范围内（导出本就不覆盖），属正常情况，不计入数据缺口", "", ""])
+    for label, rows_ in failed_fold.items():
+        reasons = sorted({record[4] for record in rows_ if record[4]})
+        rest.append(["取数失败公司", label, "取数失败", DIMENSIONS[label_key[label]][1],
+            f"该维度 {len(rows_)} 家取数失败" + ("：" + "；".join(reasons) if reasons else "")
+            + "；逐家明细见 取数说明.json 的 failed_companies", "", ""])
     for label, (count, status, others) in quiet.items():
         note = "；其余公司单独列于本表前面各行" if others else ""
         rest.append(["全部核查对象" if not others else "其余核查对象", label,

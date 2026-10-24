@@ -291,5 +291,28 @@ class Test复核优化20261008(unittest.TestCase):
         self.assertIn("甲", incomplete)
 
 
+    def test_取数失败标失败而非范围外(self):
+        """公司尝试过但没取到：标'取数失败'并计入缺口，不得标'取数范围外、属正常'。"""
+        from scripts.related_party_check import Company
+        from scripts.报告输出 import OUT_OF_SCOPE_STATUS, coverage_rows
+        filled = {"legal_person": "某人", "phones": {"13900000000"}, "emails": ["a@corp.com"],
+                  "addresses": ["某市某路1号"], "capital": 1000000.0, "found_date": "2010-01-01",
+                  "insured": 10, "business_scope": "软件开发以及信息技术咨询服务"}
+        companies = {"甲": Company("甲", **filled)}
+        file_info = [
+            {"key": key, "file": f"{key}.xlsx", "exists": True, "readable": True,
+             "companies": ["甲"], "scope": ["甲", "乙"], "terminal": "completed",
+             "created_at": "", "malformed": False,
+             "failed": {"乙": "网络错误达到重试上限：opencli 调用超时"}}
+            for key in ("basic", "shareholder_new", "actual_controller")
+        ]
+        rows, incomplete, _severe = coverage_rows(["甲", "乙"], companies, file_info, [], {"甲"})
+        yi_basic = next(row for row in rows if row[0] == "乙" and row[1] == "基础工商信息")
+        self.assertEqual(yi_basic[2], "取数失败")
+        self.assertIn("opencli 调用超时", yi_basic[4])
+        self.assertNotEqual(yi_basic[2], OUT_OF_SCOPE_STATUS)
+        self.assertIn("乙", incomplete, "取数失败是资料缺口，必须计入")
+
+
 if __name__ == "__main__":
     unittest.main()
