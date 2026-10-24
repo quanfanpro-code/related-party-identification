@@ -409,5 +409,75 @@ class ProgressResumeTests(unittest.TestCase):
         self.assertIn("opencli 调用超时", text)
 
 
+class Test通道死亡暂停(unittest.TestCase):
+    def test_候选补采通道死亡时暂停保进度(self):
+        """候选补采阶段通道死亡：暂停并保留进度，不再告警后继续出零结论报告。"""
+        from scripts.cicpa.browser_transport import ChannelDeadError
+        from scripts.discovery import Candidate, DiscoveryResult
+
+        def fake_discover(seed_name, **kwargs):
+            result = DiscoveryResult(status="completed", seed_name=seed_name, message_zh="ok")
+            result.candidates["乙公司"] = Candidate(name="乙公司", depth=1, relation_type="持股")
+            result.candidates["丙公司"] = Candidate(name="丙公司", depth=1, relation_type="持股")
+            return result
+
+        real_collect = collect_by_company
+        calls = []
+
+        def fake_collect(client, names, data_dir, **kwargs):
+            calls.append(list(names))
+            if len(names) > 1:
+                raise ChannelDeadError(
+                    "取数通道不可用，重建标签页失败：x。请确认 Edge 已打开且 OpenCLI 扩展已启用后重新运行")
+            return real_collect(client, names, data_dir, **kwargs)  # 主体保底照常成功
+
+        class FailingExporter:
+            def start_export(self, names, path):
+                raise ExportError("批量接口不可用")
+
+        with tempfile.TemporaryDirectory() as d:
+            state = TaskState(task_id="t", mode="discovery", audited_entity="甲公司", output_dir=d)
+            with mock.patch("scripts.related_party_workflow.collect_by_company", side_effect=fake_collect):
+                with redirect_stdout(StringIO()):
+                    result = run_workflow(
+                        state, Path(d) / "task.json",
+                        client_factory=lambda: FakeClient(),
+                        exporter_factory=lambda client: FailingExporter(),
+                        discoverer=fake_discover,
+                        checker=lambda **kwargs: None,
+                    )
+            self.assertEqual(result.status, "paused_export")
+            self.assertIn("Edge", result.message_zh)
+            self.assertTrue(Path(d, "task.json").is_file(), "任务状态保留，进度可续跑")
+        self.assertEqual(len(calls), 2, "主体保底一次、候选补采一次")
+        self.assertGreater(len(calls[1]), 1)
+
+    def test_主体保底通道死亡时同样暂停(self):
+        from scripts.cicpa.browser_transport import ChannelDeadError
+
+        class FailingExporter:
+            def start_export(self, names, path):
+                raise ExportError("批量接口不可用")
+
+        def dead_collect(client, names, data_dir, **kwargs):
+            raise ChannelDeadError("取数通道不可用，重建标签页失败：x。请确认 Edge 已打开后重新运行")
+
+        with tempfile.TemporaryDirectory() as d:
+            names_file = Path(d) / "名单.xlsx"
+            write_name_list(names_file, ["乙公司"])
+            state = TaskState(task_id="t", mode="list_check", audited_entity="甲公司",
+                              input_files=[str(names_file)], output_dir=d)
+            with mock.patch("scripts.related_party_workflow.collect_by_company", side_effect=dead_collect):
+                with redirect_stdout(StringIO()):
+                    result = run_workflow(
+                        state, Path(d) / "task.json",
+                        client_factory=lambda: FakeClient(),
+                        exporter_factory=lambda client: FailingExporter(),
+                        checker=lambda **kwargs: None,
+                    )
+            self.assertEqual(result.status, "paused_export")
+            self.assertIn("Edge", result.message_zh)
+
+
 if __name__ == "__main__":
     unittest.main()

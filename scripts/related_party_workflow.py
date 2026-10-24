@@ -33,7 +33,7 @@ from scripts.cicpa.auth import (
     read_login_status,
     start_guided_login,
 )
-from scripts.cicpa.browser_transport import OpenCliTransport
+from scripts.cicpa.browser_transport import ChannelDeadError, OpenCliTransport
 from scripts.cicpa.client import CicpaClient
 from scripts.cicpa.exporter import (
     CicpaExporter,
@@ -662,6 +662,9 @@ def _fallback_to_single_company(
     fallback_dir = Path(data_dir) / "逐家取数补采"
     try:
         collect_by_company(client, company_names, fallback_dir, fallback_reason=str(reason))
+    except ChannelDeadError as exc:
+        save_task_state(state_path, state)
+        raise ExportError("取数通道中断，已暂停续跑：{}".format(exc)) from exc
     except SingleCompanyError as exc:
         save_task_state(state_path, state)
         raise ExportError(
@@ -838,11 +841,14 @@ def run_workflow(
                         Path(data_dir) / "逐家取数补采",
                         fallback_reason=state.degraded_reason,
                     )
-                except SingleCompanyError as exc:
-                    state.channel_warnings.append(
-                        "逐家取数补充候选企业时未完整取得：{}".format(exc)
-                    )
+                except ChannelDeadError as exc:
                     save_task_state(state_file, state)
+                    return _pause_export(state, state_file,
+                                         ExportError("候选企业取数通道中断：{}".format(exc)))
+                except SingleCompanyError as exc:
+                    save_task_state(state_file, state)
+                    return _pause_export(state, state_file,
+                                         ExportError("逐家取数补充候选企业时全部失败：{}".format(exc)))
             elif object_records:
                 candidate_exporter = (CicpaExporter(client, artifact_dir=data_dir / "候选公司原始导出")
                                       if exporter_factory is None else exporter_factory(client))
