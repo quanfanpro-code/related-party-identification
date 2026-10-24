@@ -23,6 +23,7 @@ from scripts.cicpa.client import (
     RateLimiter,
     RatePolicy,
     Shareholder,
+    TemporaryApiError,
 )
 
 
@@ -444,6 +445,21 @@ class CompanyApiTests(unittest.TestCase):
 
         with self.assertRaises(CicpaError):
             client.search_companies("甲公司")
+
+
+class ErrorCauseTests(unittest.TestCase):
+    def test_网络错误重试上限时消息带底层原因(self):
+        """报错不能只剩外壳：底层原因（如 opencli 调用超时）必须出现在消息里。"""
+
+        class BoomSession:
+            def request(self, *args, **kwargs):
+                raise OSError("opencli 调用超时")
+
+        client = CicpaClient(session=BoomSession(), sleep=lambda _s: None)
+        with self.assertRaises(TemporaryApiError) as ctx:
+            client.request_json("GET", "https://zsk-cmis.cicpa.org.cn/x")
+        self.assertIn("网络错误达到重试上限", str(ctx.exception))
+        self.assertIn("opencli 调用超时", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -213,7 +213,9 @@ class CicpaClient:
                 if not isinstance(exc, OSError) and not request_error:
                     raise
                 if temporary_retries >= len(self.TEMP_BACKOFFS):
-                    raise TemporaryApiError("网络错误达到重试上限") from exc
+                    # 报错带出底层原因，避免只剩"网络错误达到重试上限"外壳
+                    cause = str(exc).strip() or type(exc).__name__
+                    raise TemporaryApiError("网络错误达到重试上限：{}".format(cause)) from exc
                 delay = self.TEMP_BACKOFFS[temporary_retries]
                 temporary_retries += 1
                 self._sleep(delay)
