@@ -8,6 +8,7 @@ import unittest
 
 from scripts.cicpa.browser_transport import (
     OPENCLI_SESSION,
+    ChannelDeadError,
     OpenCliBridgeError,
     OpenCliTransport,
     locate_cli,
@@ -239,6 +240,83 @@ class LoginFlowTests(unittest.TestCase):
         transport = OpenCliTransport(profile="p", runner=runner, cli_path="opencli")
         transport.wait_for_login(timeout=5.0, poll=0.0)
         self.assertIn("open", " ".join(runner.calls[1]))
+
+
+class SelfHealTests(unittest.TestCase):
+    """页面停摆自愈：调用失败重建取数标签页并重试；不可恢复时带原因与指引中止。"""
+
+    def test_调用失败后重建标签页并重试成功(self):
+        responses = [
+            OSError("opencli 调用超时"),                       # 原调用失败
+            '{"ok":true,"data":{"page":"p1"}}',                # tab new
+            "visible",                                          # 可见性复测
+            _cli_payload(200, b'{"status_code":0}'),            # 重试成功
+        ]
+        runner = FakeRunner(responses)
+        transport = OpenCliTransport(profile="p", runner=runner, cli_path="opencli")
+        resp = transport.request("GET", "https://zsk-cmis.cicpa.org.cn/x")
+        self.assertEqual(resp.status_code, 200)
+        joined = " ".join(" ".join(call) for call in runner.calls)
+        self.assertIn("tab", joined)
+        self.assertIn("new", joined)
+
+    def test_重建后仍不可见时抛ChannelDeadError并给指引(self):
+        responses = [
+            OSError("opencli 调用超时"),
+            '{"ok":true,"data":{"page":"p1"}}',
+            "hidden",                                           # 仍不可见
+        ]
+        runner = FakeRunner(responses)
+        transport = OpenCliTransport(profile="p", runner=runner, cli_path="opencli")
+        with self.assertRaises(ChannelDeadError) as ctx:
+            transport.request("GET", "https://zsk-cmis.cicpa.org.cn/x")
+        message = str(ctx.exception)
+        self.assertIn("Edge", message)
+        self.assertIn("opencli 调用超时", message)
+
+    def test_重建动作本身失败时抛ChannelDeadError(self):
+        responses = [
+            OSError("opencli 调用超时"),
+            OSError("opencli 调用失败:extension not connected"),
+        ]
+        runner = FakeRunner(responses)
+        transport = OpenCliTransport(profile="p", runner=runner, cli_path="opencli")
+        with self.assertRaises(ChannelDeadError) as ctx:
+            transport.request("GET", "https://zsk-cmis.cicpa.org.cn/x")
+        self.assertIn("扩展", str(ctx.exception))
+
+    def test_重试仍失败时错误含前后原因(self):
+        responses = [
+            OSError("opencli 调用超时"),
+            '{"ok":true,"data":{"page":"p1"}}',
+            "visible",
+            OSError("opencli 调用失败:cdp timeout"),
+        ]
+        runner = FakeRunner(responses)
+        transport = OpenCliTransport(profile="p", runner=runner, cli_path="opencli")
+        with self.assertRaises(OpenCliBridgeError) as ctx:
+            transport.request("GET", "https://zsk-cmis.cicpa.org.cn/x")
+        message = str(ctx.exception)
+        self.assertIn("opencli 调用超时", message)
+        self.assertIn("cdp timeout", message)
+
+    def test_verify_session遇通道死亡不再吞成False(self):
+        responses = [
+            OSError("opencli 调用超时"),
+            OSError("opencli 调用失败:extension not connected"),
+        ]
+        runner = FakeRunner(responses)
+        transport = OpenCliTransport(profile="p", runner=runner, cli_path="opencli")
+        with self.assertRaises(ChannelDeadError):
+            transport.verify_session()
+
+    def test_页面fetch报错不再伪装成空响应(self):
+        payload = json.dumps({"s": 0, "h": {}, "b": "", "e": "TypeError: Failed to fetch"})
+        runner = FakeRunner([payload])
+        transport = OpenCliTransport(profile="p", runner=runner, cli_path="opencli")
+        with self.assertRaises(OpenCliBridgeError) as ctx:
+            transport.request("GET", "https://zsk-cmis.cicpa.org.cn/x")
+        self.assertIn("Failed to fetch", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -23,6 +23,10 @@ class OpenCliBridgeError(RuntimeError):
     """opencli 通道不可用或返回内容无效。"""
 
 
+class ChannelDeadError(OpenCliBridgeError):
+    """通道死亡且自愈失败（扩展断连、Edge 最小化等），消息含底层原因与操作指引。"""
+
+
 def locate_cli(which: Callable[[str], Optional[str]] = shutil.which) -> str:
     found = which("opencli")
     if not found:
@@ -173,11 +177,56 @@ class OpenCliTransport:
         """opencli 2.x 用 `browser --session <名> <子命令>`,1.x 为位置参数。"""
         return ["--profile", self.profile, "browser", "--session", self.session_name, *args]
 
-    def _eval(self, js: str, timeout: float = 60.0) -> str:
-        result = self._run(self._browser_args("eval", js), timeout=timeout)
+    def _eval_args(self, args: List[str], timeout: float = 60.0) -> str:
+        result = self._run(args, timeout=timeout)
         if getattr(result, "returncode", 0) != 0:
             raise OSError("opencli 调用失败:{}".format(getattr(result, "stderr", "") or ""))
         return _unwrap_eval_output(result.stdout or "")
+
+    def _eval_once(self, js: str, timeout: float = 60.0) -> str:
+        return self._eval_args(self._browser_args("eval", js), timeout=timeout)
+
+    def _rebuild_tab(self, previous=None) -> None:
+        """重建取数标签页并确认可见；失败抛 ChannelDeadError（含底层原因与指引）。"""
+        cause = (str(previous).strip() or type(previous).__name__) if previous else ""
+        try:
+            result = self._run(self._browser_args("tab", "new", ZSK_BASE + "/#/home_local"), timeout=40.0)
+        except OSError as exc:
+            raise ChannelDeadError(
+                "取数通道不可用，重建标签页失败：{}。请确认 Edge 已打开且 OpenCLI 扩展已启用后重新运行；"
+                "已保存进度可续跑。前因：{}".format(exc, cause or "无")
+            ) from exc
+        if getattr(result, "returncode", 0) != 0:
+            raise ChannelDeadError(
+                "取数通道不可用，重建标签页失败：{}。请确认 Edge 已打开且 OpenCLI 扩展已启用后重新运行；"
+                "已保存进度可续跑。前因：{}".format(getattr(result, "stderr", "") or "命令返回非零", cause or "无")
+            )
+        visibility = str(self._eval_once("document.visibilityState", timeout=15.0)).strip().strip('"')
+        if visibility != "visible":
+            raise ChannelDeadError(
+                "取数标签页不可见（Edge 可能已最小化或被遮挡）。请恢复 Edge 窗口后重新运行；"
+                "已保存进度可续跑。前因：{}".format(cause or "无")
+            )
+
+    def _eval(self, js: str, timeout: float = 60.0) -> str:
+        """页面求值：失败时自动重建取数标签页并重试一次，尽量不让页面停摆废掉任务。
+
+        参数构造（profile 解析等）在自愈范围之外——扩展未连接是通道配置问题，
+        重建标签页救不了，也不该多耗一次调用。
+        """
+        args = self._browser_args("eval", js)
+        try:
+            return self._eval_args(args, timeout=timeout)
+        except ChannelDeadError:
+            raise
+        except (OSError, OpenCliBridgeError) as exc:
+            self._rebuild_tab(previous=exc)
+            try:
+                return self._eval_args(args, timeout=timeout)
+            except (OSError, OpenCliBridgeError) as retry_exc:
+                raise OpenCliBridgeError(
+                    "页面取数失败（已重建标签页仍失败）：{}；前因：{}".format(retry_exc, exc)
+                ) from retry_exc
 
     def open_page(self, url: str) -> None:
         self._run(self._browser_args("open", url), timeout=60.0)
@@ -199,6 +248,8 @@ class OpenCliTransport:
     def verify_session(self) -> bool:
         try:
             payload = jsonlib.loads(self._eval(self._verify_js()))
+        except ChannelDeadError:
+            raise
         except (jsonlib.JSONDecodeError, OpenCliBridgeError):
             return False
         return payload.get("status_code") == 0
@@ -300,6 +351,9 @@ class OpenCliTransport:
             payload = jsonlib.loads(output)
         except jsonlib.JSONDecodeError as exc:
             raise OpenCliBridgeError("页面取数返回内容无法解析") from exc
+        # 页面内 fetch 报错（如断网、被拦）不再伪装成空响应，直接带出真实原因
+        if payload.get("e") and not payload.get("s"):
+            raise OpenCliBridgeError("页面请求失败：{}".format(payload.get("e")))
         if payload.get("nav"):
             if _nav_retries >= 2:
                 raise OpenCliBridgeError("页面连续偏离注协域名，重新打开 2 次后仍未恢复")
