@@ -326,5 +326,88 @@ class Test对手方列不猜位置(unittest.TestCase):
             self.assertEqual(warnings, [])
 
 
+class ProgressResumeTests(unittest.TestCase):
+    """逐家落盘断点续跑：每家成功立即写进度，重跑跳过已完成、重试失败。"""
+
+    def _profile(self, name):
+        from scripts.逐家取数 import CompanyProfile
+        profile = CompanyProfile(name=name, company_id="id-" + name)
+        profile.basic = [name, "id-" + name] + [""] * 21
+        return profile
+
+    def test_每家成功立即写进度文件(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            seen = []
+
+            def fake_fetch(client, name):
+                seen.append((name, (data_dir / "逐家进度.json").exists()))
+                return self._profile(name)
+
+            with mock.patch("scripts.逐家取数.fetch_company", side_effect=fake_fetch):
+                collect_by_company(FakeClient(), ["甲公司", "乙公司"], data_dir)
+            self.assertFalse(seen[0][1], "第一家取完前不应有进度文件")
+            self.assertTrue(seen[1][1], "第二家开始时第一家已落盘")
+
+    def test_重跑跳过已完成并重试失败(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            calls = []
+
+            def fake_fetch(client, name):
+                calls.append(name)
+                if name == "乙公司" and len(calls) <= 2:
+                    raise RuntimeError("网络错误达到重试上限：opencli 调用超时")
+                return self._profile(name)
+
+            with mock.patch("scripts.逐家取数.fetch_company", side_effect=fake_fetch):
+                collect_by_company(FakeClient(), ["甲公司", "乙公司"], data_dir)  # 首轮：乙失败
+                calls.clear()
+                collect_by_company(FakeClient(), ["甲公司", "乙公司"], data_dir)  # 二轮
+            self.assertEqual(calls, ["乙公司"], "第二轮只重试失败公司，不重取甲公司")
+
+    def test_取数说明记全部尝试公司与失败原因(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+
+            def fake_fetch(client, name):
+                if name == "乙公司":
+                    raise RuntimeError("网络错误达到重试上限：opencli 调用超时")
+                return self._profile(name)
+
+            with mock.patch("scripts.逐家取数.fetch_company", side_effect=fake_fetch):
+                collect_by_company(FakeClient(), ["甲公司", "乙公司"], data_dir)
+            payload = json.loads((data_dir / "取数说明.json").read_text(encoding="utf-8-sig"))
+            self.assertEqual(payload["company_names"], ["甲公司", "乙公司"],
+                             "取数范围含全部尝试过的公司，失败公司不得消失")
+            self.assertIn("乙公司", payload["failed_companies"])
+            self.assertIn("opencli 调用超时", payload["failed_companies"]["乙公司"])
+
+    def test_通道死亡立即中止不再逐家耗完(self):
+        from scripts.cicpa.browser_transport import ChannelDeadError
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            calls = []
+
+            def fake_fetch(client, name):
+                calls.append(name)
+                raise ChannelDeadError("取数通道不可用，重建标签页失败：x。请确认 Edge 已打开")
+
+            with mock.patch("scripts.逐家取数.fetch_company", side_effect=fake_fetch):
+                with self.assertRaises(ChannelDeadError):
+                    collect_by_company(FakeClient(), ["甲", "乙", "丙"], data_dir)
+            self.assertEqual(calls, ["甲"], "通道死亡后不再继续第二家")
+
+    def test_失败公司的原因含原因链(self):
+        from scripts.逐家取数 import error_text
+        inner = OSError("opencli 调用超时")
+        outer = RuntimeError("网络错误达到重试上限")
+        outer.__cause__ = inner
+        text = error_text(outer)
+        self.assertIn("网络错误达到重试上限", text)
+        self.assertIn("opencli 调用超时", text)
+
+
 if __name__ == "__main__":
     unittest.main()

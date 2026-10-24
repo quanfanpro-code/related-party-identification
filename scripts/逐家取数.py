@@ -10,11 +10,13 @@
 # 取不到的维度（客户、供应商、发票信息、变更记录、主要人员等）如实记为数据缺口，
 # 在取数说明中标注，绝不假装已取得。
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from scripts.cicpa.browser_transport import ChannelDeadError
 from scripts.state_io import atomic_write_json
 
 
@@ -60,6 +62,47 @@ INVEST_HEADERS = ("序号", "公司名称", "被投资企业名称", "被投资�
 
 class SingleCompanyError(RuntimeError):
     """逐家取数无法继续。"""
+
+
+PROGRESS_NAME = "逐家进度.json"
+
+
+def error_text(exc: BaseException) -> str:
+    """拼出异常原因链文本：外壳报错不能吞掉底层原因。"""
+    parts: List[str] = []
+    seen = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).strip() or type(current).__name__
+        if text not in parts:
+            parts.append(text)
+        current = current.__cause__ or current.__context__
+    return "；".join(parts)
+
+
+def _load_progress(data_dir: Path) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """读逐家进度；文件缺失或损坏按空进度处理（不阻断任务）。"""
+    path = Path(data_dir) / PROGRESS_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}, {}
+    completed = payload.get("completed") if isinstance(payload.get("completed"), dict) else {}
+    failed = payload.get("failed") if isinstance(payload.get("failed"), dict) else {}
+    return dict(completed), {str(k): str(v) for k, v in failed.items()}
+
+
+def _save_progress(data_dir: Path, completed: Dict[str, Any], failed: Dict[str, str]) -> None:
+    """每取完一家立即原子落盘，中途意外不丢整轮进度。"""
+    atomic_write_json(
+        Path(data_dir) / PROGRESS_NAME,
+        {
+            "completed": completed,
+            "failed": failed,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    )
 
 
 @dataclass
@@ -339,8 +382,9 @@ def write_scope_note(
     *,
     fallback_reason: str,
     warnings: List[str],
+    failed: Optional[Dict[str, str]] = None,
 ) -> Path:
-    """写取数说明，交代为什么走逐家取数、覆盖了哪些维度、缺了哪些。"""
+    """写取数说明，交代为什么走逐家取数、覆盖了哪些维度、缺了哪些、哪些公司没取到及原因。"""
     payload = {
         "company_names": list(company_names),
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -350,6 +394,7 @@ def write_scope_note(
         "dimension_results": dict(dimension_results),
         "batch_history": [],
         "unavailable_dimensions": list(UNAVAILABLE_DIMENSIONS),
+        "failed_companies": dict(failed or {}),
         "warnings": list(dict.fromkeys(warnings)),
     }
     path = Path(data_dir) / "取数说明.json"
@@ -364,31 +409,58 @@ def collect_by_company(
     *,
     fallback_reason: str = "",
 ) -> Tuple[Dict[str, str], List[str]]:
-    """逐个企业取数并落盘，返回（维度完成情况，告警）。"""
+    """逐个企业取数并逐家落盘，返回（维度完成情况，告警）。
+
+    每成功一家立即写进度文件；重跑时跳过已保存的公司、重试失败的公司。
+    通道死亡（ChannelDeadError）立即中止并上抛——进度已保住，不再逐家耗完。
+    """
     names = [str(name).strip() for name in company_names if str(name).strip()]
     names = list(dict.fromkeys(names))
     if not names:
         raise SingleCompanyError("逐家取数的企业名单为空")
 
-    profiles: List[CompanyProfile] = []
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    completed, failed = _load_progress(data_dir)
+    # 进度只认本次名单内的公司：换了核查对象不能把旧进度当成果
+    wanted = set(names)
+    completed = {k: v for k, v in completed.items() if k in wanted}
+    failed = {k: v for k, v in failed.items() if k in wanted}
+
     warnings: List[str] = []
     for name in names:
+        if name in completed:
+            continue
         try:
-            profiles.append(fetch_company(client, name))
+            profile = fetch_company(client, name)
+        except ChannelDeadError:
+            raise  # 通道死亡：立即中止，已保存进度不动
         except Exception as exc:  # 单个企业失败不阻断其余企业
-            warnings.append("逐家取数失败：{}（{}）".format(name, exc))
+            message = error_text(exc)
+            failed[name] = message
+            warnings.append("逐家取数失败：{}（{}）".format(name, message))
+            _save_progress(data_dir, completed, failed)
+            continue
+        completed[name] = asdict(profile)
+        failed.pop(name, None)
+        warnings.extend(profile.warnings)
+        _save_progress(data_dir, completed, failed)
 
+    profiles = [CompanyProfile(**completed[name]) for name in names if name in completed]
     if not profiles:
-        raise SingleCompanyError("全部企业逐家取数均失败，未取得任何可用资料")
+        raise SingleCompanyError(
+            "全部企业逐家取数均失败，未取得任何可用资料；失败原因摘要：{}".format(
+                "；".join("{}：{}".format(k, v) for k, v in list(failed.items())[:5])
+            )
+        )
 
     dimension_results = write_dimension_files(profiles, data_dir, warnings=warnings)
-    for profile in profiles:
-        warnings.extend(profile.warnings)
     write_scope_note(
         data_dir,
-        [profile.name for profile in profiles],
+        names,
         dimension_results,
         fallback_reason=fallback_reason,
         warnings=warnings,
+        failed=failed,
     )
     return dimension_results, warnings
