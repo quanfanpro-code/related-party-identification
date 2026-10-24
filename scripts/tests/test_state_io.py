@@ -37,7 +37,7 @@ class AtomicWriteJsonTests(unittest.TestCase):
 
         raw = target.read_bytes()
         self.assertEqual(len(attempts), 3)
-        self.assertEqual(waits, [0.2, 0.2])
+        self.assertEqual(waits, [0.4, 0.4])
         self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
         self.assertEqual(json.loads(raw.decode("utf-8")), {"企业": "甲公司"})
 
@@ -59,8 +59,8 @@ class AtomicWriteJsonTests(unittest.TestCase):
                 sleeper=waits.append,
             )
 
-        self.assertEqual(len(attempts), 3)
-        self.assertEqual(waits, [0.2, 0.2])
+        self.assertEqual(len(attempts), 5)
+        self.assertEqual(waits, [0.4, 0.4, 0.4, 0.4])
         self.assertEqual(target.read_text(encoding="utf-8"), '{"status":"old"}')
 
 
