@@ -249,7 +249,6 @@ class SelfHealTests(unittest.TestCase):
         responses = [
             OSError("opencli 调用超时"),                       # 原调用失败
             '{"ok":true,"data":{"page":"p1"}}',                # tab new
-            "visible",                                          # 可见性复测
             _cli_payload(200, b'{"status_code":0}'),            # 重试成功
         ]
         runner = FakeRunner(responses)
@@ -260,19 +259,19 @@ class SelfHealTests(unittest.TestCase):
         self.assertIn("tab", joined)
         self.assertIn("new", joined)
 
-    def test_重建后仍不可见时抛ChannelDeadError并给指引(self):
+    def test_重建标签页不以可见性论生死(self):
+        """最小化后台跑是合法用法：重建后哪怕页面隐藏，重试取到数就算好。"""
         responses = [
             OSError("opencli 调用超时"),
             '{"ok":true,"data":{"page":"p1"}}',
-            "hidden",                                           # 仍不可见
+            _cli_payload(200, b'{"status_code":0}'),            # 隐藏状态下重试照样成功
         ]
         runner = FakeRunner(responses)
         transport = OpenCliTransport(profile="p", runner=runner, cli_path="opencli")
-        with self.assertRaises(ChannelDeadError) as ctx:
-            transport.request("GET", "https://zsk-cmis.cicpa.org.cn/x")
-        message = str(ctx.exception)
-        self.assertIn("Edge", message)
-        self.assertIn("opencli 调用超时", message)
+        resp = transport.request("GET", "https://zsk-cmis.cicpa.org.cn/x")
+        self.assertEqual(resp.status_code, 200)
+        joined = " ".join(" ".join(call) for call in runner.calls)
+        self.assertNotIn("visibilityState", joined, "不再查询可见性，不因隐藏判死")
 
     def test_重建动作本身失败时抛ChannelDeadError(self):
         responses = [
@@ -289,7 +288,6 @@ class SelfHealTests(unittest.TestCase):
         responses = [
             OSError("opencli 调用超时"),
             '{"ok":true,"data":{"page":"p1"}}',
-            "visible",
             OSError("opencli 调用失败:cdp timeout"),
         ]
         runner = FakeRunner(responses)

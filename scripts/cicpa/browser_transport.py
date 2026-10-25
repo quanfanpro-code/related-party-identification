@@ -187,7 +187,12 @@ class OpenCliTransport:
         return self._eval_args(self._browser_args("eval", js), timeout=timeout)
 
     def _rebuild_tab(self, previous=None) -> None:
-        """重建取数标签页并确认可见；失败抛 ChannelDeadError（含底层原因与指引）。"""
+        """重建取数标签页；失败抛 ChannelDeadError（含底层原因与指引）。
+
+        不以窗口/标签页可见性论生死：最小化后台跑是合法用法（2026-10-25 实测
+        最小化后新标签页 0.3 秒正常返回），健康与否以重建后能否实际取到数为准，
+        由调用方重试验证。
+        """
         cause = (str(previous).strip() or type(previous).__name__) if previous else ""
         try:
             result = self._run(self._browser_args("tab", "new", ZSK_BASE + "/#/home_local"), timeout=40.0)
@@ -200,12 +205,6 @@ class OpenCliTransport:
             raise ChannelDeadError(
                 "取数通道不可用，重建标签页失败：{}。请确认 Edge 已打开且 OpenCLI 扩展已启用后重新运行；"
                 "已保存进度可续跑。前因：{}".format(getattr(result, "stderr", "") or "命令返回非零", cause or "无")
-            )
-        visibility = str(self._eval_once("document.visibilityState", timeout=15.0)).strip().strip('"')
-        if visibility != "visible":
-            raise ChannelDeadError(
-                "取数标签页不可见（Edge 可能已最小化或被遮挡）。请恢复 Edge 窗口后重新运行；"
-                "已保存进度可续跑。前因：{}".format(cause or "无")
             )
 
     def _eval(self, js: str, timeout: float = 60.0) -> str:
