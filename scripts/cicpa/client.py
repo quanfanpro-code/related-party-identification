@@ -87,7 +87,7 @@ class RatePolicy:
     """本 skill 的保守访问频率自我约束。"""
 
     max_per_minute: int = 15
-    max_per_hour: int = 300
+    max_per_hour: int = 900  # ponytail: 原默认300过于保守，改为与15/分钟自洽；被注协限流再降回
     normal_delay: Tuple[float, float] = (2.0, 5.0)
     poll_delay: Tuple[float, float] = (10.0, 20.0)
 
