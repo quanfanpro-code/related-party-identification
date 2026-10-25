@@ -4,6 +4,7 @@ from datetime import datetime
 import hashlib
 import math
 import os
+import re
 from pathlib import Path
 
 import openpyxl
@@ -230,6 +231,67 @@ def clue_summary(item, limit=SUMMARY_LIMIT):
     return prefix + joined
 
 
+_PATH_NODE_SPLIT = re.compile(r"\s+→\s+|\s+--.*?-->\s*")
+_ORG_WORDS = ("公司", "企业", "合伙", "合作社", "委员会")
+
+
+def _hop(parent, child, objects):
+    """在候选记录里找 parent→child 这一跳的股权证据，确定持股方向。
+
+    发现引擎的语义是确定的：对外投资=parent 持有 child；股东关系=child 持有 parent。
+    """
+    child_record = objects.get(child) or {}
+    for source in child_record.get("sources") or []:
+        if source.get("company") == parent and source.get("counterparty") == child \
+                and source.get("relation_type") in ("对外投资", "股东关系"):
+            return source
+    parent_record = objects.get(parent) or {}
+    for source in parent_record.get("sources") or []:
+        if source.get("counterparty") == child and source.get("relation_type") in ("对外投资", "股东关系"):
+            return source
+    if child_record.get("parent_name") == parent:
+        return {"relation_type": child_record.get("relation_type"), "ratio": child_record.get("ratio")}
+    return None
+
+
+def _render_one_path(path, objects):
+    nodes = [n.strip() for n in _PATH_NODE_SPLIT.split(str(path)) if n and n.strip()]
+    if len(nodes) < 2:
+        return str(path)
+    text = nodes[0]
+    for i in range(len(nodes) - 1):
+        parent, child = nodes[i], nodes[i + 1]
+        hop = _hop(parent, child, objects)
+        ratio = hop.get("ratio") if hop else None
+        ratio_text = "{:g}%".format(ratio) if isinstance(ratio, (int, float)) else "比例未取得"
+        if not hop:
+            text += " → "
+        elif hop.get("relation_type") == "股东关系":
+            text += " <──{}── ".format(ratio_text)
+        else:
+            text += " ──{}──> ".format(ratio_text)
+        child_text = str(child)
+        if not any(word in child_text for word in _ORG_WORDS):
+            text += child_text + "（自然人）"
+        else:
+            text += child_text
+    return text
+
+
+def render_discovery_paths(record, objects):
+    """发现路径渲染成"谁持有谁"的读法：箭头从持有方指向被持股方，比例标在箭头上。"""
+    paths = record.get("paths") or []
+    rendered = list(dict.fromkeys(_render_one_path(path, objects) for path in paths))
+    if not rendered:
+        return ""
+    rendered.sort(key=lambda t: (t.count("──"), len(t)))
+    if len(rendered) > 5:
+        kept = rendered[:5]
+        kept.append("…另有 {} 条等效发现路径，见候选发现记录.json".format(len(rendered) - 5))
+        return "\n".join(kept)
+    return "\n".join(rendered)
+
+
 def coverage_rows(names, companies, file_info, errors, target_set=None):
     target_set = set(target_set or ())
     rows = []
@@ -403,7 +465,7 @@ def write_report(out_path, summary, all_hits, companies, target_display,
                 ratio_text = "比例未取得" if source.get("ratio") is None else str(source["ratio"]) + "%"
                 source_notes.append(f"股权查询：{source.get('company', '')}（{source.get('company_id', '')}） / {source.get('relation_type', '')} / {source.get('counterparty', '')} / {ratio_text}")
         append_row(roster, [name, origin, reason, record.get("depth", ""), record.get("parent_name", ""),
-            "\n".join(record.get("paths", [])), "存在资料缺口" if name in incomplete else "已取得本次核查资料", outcome,
+            render_discovery_paths(record, objects), "存在资料缺口" if name in incomplete else "已取得本次核查资料", outcome,
             company.legal_person if company else "", company.found_date if company else "", company.capital if company else None,
             company.insured if company else None, "\n".join(source_notes + record.get("notes", []))])
 
@@ -535,6 +597,7 @@ def write_report(out_path, summary, all_hits, companies, target_display,
                    ["报告生成时间", datetime.now().astimezone().isoformat(timespec="seconds")]] + [[key, value] for key, value in scope.items()]:
         append_row(explanation, values)
     append_row(explanation, ["阅读方法", "核查结论 → 复核底稿 → 证据明细 → 原始单元格。证据明细同一编号的多行是同一条证据的不同来源。"])
+    append_row(explanation, ["关系路径读法", "箭头从持有方指向被持股方：A ──30%──> B 表示 A 持有 B 30% 股份；A <──25%── B 表示 B 持有 A 25% 股份；（自然人）为个人股东。路径是程序发现候选时经过的股权链，只代表登记的持股线索，不构成控制关系认定。"])
     append_row(explanation, ["筛选与链接", "底稿与证据之间按编号定位，排序后仍可往返。查看全部证据时，按公司列筛选；来源文件同时标明工作表和单元格。"])
     append_row(explanation, ["原始资料", "报告与原始资料目录应一起移动。链接使用相对路径；若客户端只打开文件，按同时显示的工作表和单元格定位。"])
     append_row(explanation, ["日期口径", "核查基准日用于计算成立时间等规则；原始记录日期见对应原表字段。取数任务创建时间不等同于记录生效日期。"])
