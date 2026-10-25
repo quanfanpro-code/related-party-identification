@@ -284,7 +284,7 @@ class SelfHealTests(unittest.TestCase):
             transport.request("GET", "https://zsk-cmis.cicpa.org.cn/x")
         self.assertIn("扩展", str(ctx.exception))
 
-    def test_重试仍失败时错误含前后原因(self):
+    def test_重试仍失败时按通道死亡暂停且错误含前后原因(self):
         responses = [
             OSError("opencli 调用超时"),
             '{"ok":true,"data":{"page":"p1"}}',
@@ -292,11 +292,12 @@ class SelfHealTests(unittest.TestCase):
         ]
         runner = FakeRunner(responses)
         transport = OpenCliTransport(profile="p", runner=runner, cli_path="opencli")
-        with self.assertRaises(OpenCliBridgeError) as ctx:
+        with self.assertRaises(ChannelDeadError) as ctx:
             transport.request("GET", "https://zsk-cmis.cicpa.org.cn/x")
         message = str(ctx.exception)
         self.assertIn("opencli 调用超时", message)
         self.assertIn("cdp timeout", message)
+        self.assertIn("已保存进度可续跑", message)
 
     def test_verify_session遇通道死亡不再吞成False(self):
         responses = [

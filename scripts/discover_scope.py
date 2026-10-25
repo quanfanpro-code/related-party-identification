@@ -60,8 +60,8 @@ def main(argv=None):
     parser.add_argument(
         "--depth",
         type=int,
-        default=2,
-        help="初始穿透深度（默认 2 层，明确确认后最多 5 层）",
+        default=5,
+        help="初始穿透深度（默认 5 层；本兼容入口支持 1 至 5 层）",
     )
     parser.add_argument(
         "--threshold",

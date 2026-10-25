@@ -366,7 +366,9 @@ def _check_dialog_entries(root: Path, errors: list[str]) -> bool:
         "每分钟最多 15 次",
         "每小时最多 300 次",
         "不等于最终关联方结论",
-        "Firefox",
+        "Microsoft Edge",
+        "默认穿透 5 层",
+        "八张工作表",
         "OpenCLI",
         "Gitee 国内镜像",
     )

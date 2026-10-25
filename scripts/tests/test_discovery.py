@@ -230,6 +230,8 @@ class CompatibilityEntryTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("初始穿透深度", completed.stdout)
+        self.assertIn("默认 5 层", completed.stdout)
+        self.assertNotIn("默认 2 层", completed.stdout)
 
 
 if __name__ == "__main__":

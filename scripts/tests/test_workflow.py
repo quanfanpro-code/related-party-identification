@@ -986,8 +986,8 @@ class SkillDocumentationContractTests(unittest.TestCase):
             "公开供应商关系",
             "只作为候选",
             "不能单独形成风险证据",
-            "初始 2 层",
-            "最多 5 层",
+            "默认穿透 5 层",
+            "超过 5 层须先",
             "只能从完整维度导出",
         ]:
             with self.subTest(phrase=phrase):
@@ -996,6 +996,9 @@ class SkillDocumentationContractTests(unittest.TestCase):
         for phrase in [
             "注协标记关联关系",
             "导出表内关联标注",
+            "首选 Firefox",
+            "初始查 2 层",
+            "报告固定七表",
         ]:
             with self.subTest(phrase=phrase):
                 self.assertNotIn(phrase, combined)

@@ -24,7 +24,7 @@ class OpenCliBridgeError(RuntimeError):
 
 
 class ChannelDeadError(OpenCliBridgeError):
-    """通道死亡且自愈失败（扩展断连、Edge 最小化等），消息含底层原因与操作指引。"""
+    """通道死亡且自愈失败，消息含底层原因与操作指引；最小化不属于通道死亡。"""
 
 
 def locate_cli(which: Callable[[str], Optional[str]] = shutil.which) -> str:
@@ -223,8 +223,11 @@ class OpenCliTransport:
             try:
                 return self._eval_args(args, timeout=timeout)
             except (OSError, OpenCliBridgeError) as retry_exc:
-                raise OpenCliBridgeError(
-                    "页面取数失败（已重建标签页仍失败）：{}；前因：{}".format(retry_exc, exc)
+                raise ChannelDeadError(
+                    "页面取数失败（已重建标签页仍失败）：{}；前因：{}。"
+                    "请确认浏览器可正常使用且 OpenCLI 扩展已启用；已保存进度可续跑。".format(
+                        retry_exc, exc
+                    )
                 ) from retry_exc
 
     def open_page(self, url: str) -> None:
