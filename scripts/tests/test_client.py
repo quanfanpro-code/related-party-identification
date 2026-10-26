@@ -106,6 +106,7 @@ class RateLimiterTests(unittest.TestCase):
         limiter = RateLimiter(
             policy=RatePolicy(
                 max_per_minute=1000,
+                max_per_hour=300,  # 显式指定，测试验证窗口机制而不随默认值漂移
                 normal_delay=(0.0, 0.0),
                 poll_delay=(0.0, 0.0),
             ),
