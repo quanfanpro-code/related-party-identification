@@ -69,6 +69,7 @@ class TaskState:
     maximum_depth: int = 5
     approved_depth: int = 5
     candidate_cap: int = 100
+    equity_threshold: float = 20.0
     input_files: List[str] = field(default_factory=list)
     output_dir: str = ""
     export_state_path: str = ""
@@ -133,6 +134,7 @@ def resume_or_init_state(args) -> TaskState:
     """
     state_path = Path(args.state_path)
     if not state_path.exists():
+        threshold = getattr(args, "equity_threshold", None)
         return TaskState(
             task_id=state_path.stem,
             mode=args.mode,
@@ -142,6 +144,7 @@ def resume_or_init_state(args) -> TaskState:
             approved_depth=args.approved_depth,
             candidate_cap=args.candidate_cap,
             as_of_date=args.as_of_date,
+            equity_threshold=float(threshold) if threshold is not None else 20.0,
         )
     state = load_task_state(state_path)
     if state.mode != args.mode or state.audited_entity != args.audited_entity:
@@ -157,6 +160,9 @@ def resume_or_init_state(args) -> TaskState:
         state.output_dir = args.output_dir
     if args.as_of_date:
         state.as_of_date = args.as_of_date
+    threshold = getattr(args, "equity_threshold", None)
+    if threshold is not None:
+        state.equity_threshold = float(threshold)
     state.candidate_cap = max(int(args.candidate_cap), int(state.candidate_cap or 0))
     state.approved_depth = max(int(args.approved_depth), int(state.approved_depth or 0))
     state.maximum_depth = max(int(state.maximum_depth or 0), state.approved_depth)
@@ -806,7 +812,8 @@ def run_workflow(
                 discovery_result = discoverer(
                     state.audited_entity, client=client,
                     policy=DiscoveryPolicy(initial_depth=state.initial_depth,
-                        maximum_depth=state.maximum_depth, candidate_cap=state.candidate_cap),
+                        maximum_depth=state.maximum_depth, candidate_cap=state.candidate_cap,
+                        equity_threshold=state.equity_threshold),
                     approved_depth=state.approved_depth,
                     seed_export_candidates=seed_candidates,
                     resume=state.discovery_progress or None,
@@ -881,6 +888,7 @@ def run_workflow(
             "初始穿透层数": state.initial_depth,
             "批准穿透层数": state.approved_depth,
             "最多穿透层数": state.maximum_depth,
+            "持股穿透比例": state.equity_threshold,
             "候选上限": state.candidate_cap,
             "候选数量": candidate_count,
         },
@@ -938,10 +946,13 @@ def main(argv=None) -> int:
                             help="穿透层数，默认 5 层；超过 5 层须先在对话中向用户确认")
     run_parser.add_argument("--as-of-date", default="", help="核查基准日，格式 YYYY-MM-DD；缺省为运行当天")
     run_parser.add_argument("--candidate-cap", type=int, default=100, help="候选企业数量上限；已有状态文件时按续跑处理，只增不减")
+    run_parser.add_argument("--equity-threshold", type=float, default=None,
+                            help="持股穿透比例（百分比），达到该比例的股权关系才纳入候选；缺省 20，不指定则沿用状态文件原值")
     resume_parser = subparsers.add_parser("resume", help="恢复关联方识别任务")
     resume_parser.add_argument("--state-path", required=True, type=Path)
     resume_parser.add_argument("--candidate-cap", type=int, default=None, help="续跑时放宽候选上限；只增不减")
     resume_parser.add_argument("--approved-depth", type=int, default=None, help="续跑时放宽穿透层数；只增不减")
+    resume_parser.add_argument("--equity-threshold", type=float, default=None, help="续跑时更新持股穿透比例（百分比）；不指定则沿用任务原值")
     subparsers.add_parser("validate", help="验证 skill 分发包")
     args = parser.parse_args(argv)
 
@@ -1008,6 +1019,8 @@ def main(argv=None) -> int:
         if args.approved_depth:
             state.approved_depth = max(int(args.approved_depth), int(state.approved_depth or 0))
             state.maximum_depth = max(int(state.maximum_depth or 0), state.approved_depth)
+        if args.equity_threshold is not None:
+            state.equity_threshold = float(args.equity_threshold)
         login = (
             {"status": "authenticated"}
             if state.mode == "existing_export"
